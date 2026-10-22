@@ -120,7 +120,7 @@ function buildRequestContext(context, requestId) {
 function stripInternalMessageMetadata(messages) {
     return messages.map(message => {
         if (!message || typeof message !== 'object') return message;
-        const { __vcpchatTimestampMeta, ...cleanMessage } = message;
+        const { __vcpchatTimestampMeta, __vcpContextCheckpoint, ...cleanMessage } = message;
         return cleanMessage;
     });
 }
@@ -166,8 +166,6 @@ let ipcHandlersRegistered = false;
 const flowlockClaimLocks = new Map();
 const vcpStreamTasks = new SenderTaskRegistry({ label: 'vcp-stream-tasks' });
 const INTERRUPT_TIMEOUT_MS = 5000;
-// 同 sideChatHandlers.js 的 CHILD_ID_PATTERN
-const SIDE_CHAT_CHILD_ID = /^sidechat_\d+_[0-9a-f]+$/;
 
 function getVcpStreamTaskSnapshot() {
     return vcpStreamTasks.snapshot();
@@ -616,12 +614,7 @@ function initialize(mainWindow, context) {
         if (!topicId) return { error: `获取Agent ${agentId} 聊天历史失败: topicId 未提供。` };
         try {
             const historyFile = path.join(USER_DATA_DIR, agentId, 'topics', topicId, 'history.json');
-            // 辅助对话的子话题目录只由 side-chat:create-child 建；已被删掉时不能在读取时顺手建回来
-            //（流式回复在父话题被删后收尾时会先读再写），否则留下没有标记、删不掉的孤儿目录
-            if (SIDE_CHAT_CHILD_ID.test(String(topicId)) && !await fs.pathExists(path.dirname(historyFile))) return [];
-            await fs.ensureDir(path.dirname(historyFile));
-
-
+            // 只读获取历史绝不创建目录，防止已删除的话题被并发的列表未读统计或懒加载重新创建出空文件夹
             if (await fs.pathExists(historyFile)) {
                 return await fs.readJson(historyFile);
             }
@@ -768,6 +761,21 @@ function initialize(mainWindow, context) {
 
                 const topicDataDir = path.join(USER_DATA_DIR, agentId, 'topics', topicIdToDelete);
                 if (await fs.pathExists(topicDataDir)) await fs.remove(topicDataDir);
+                const topicBackupPath = path.join(AGENT_DIR, agentId, 'config.topic.backup.json');
+                if (await fs.pathExists(topicBackupPath)) {
+                    try {
+                        const topicBackup = await fs.readJson(topicBackupPath);
+                        if (topicBackup && Array.isArray(topicBackup.topics)) {
+                            const nextTopics = topicBackup.topics.filter(topic => topic && topic.id !== topicIdToDelete);
+                            if (nextTopics.length !== topicBackup.topics.length) {
+                                topicBackup.topics = nextTopics;
+                                await fs.writeJson(topicBackupPath, topicBackup, { spaces: 2 });
+                            }
+                        }
+                    } catch (backupErr) {
+                        console.warn('[delete-topic] Failed to prune config.topic.backup.json:', backupErr);
+                    }
+                }
                 await clearTrajectoryOf({ agentId, topicId: topicIdToDelete });
                 await removeSideChatChildrenOfParent({ USER_DATA_DIR, agentId, parentTopicId: topicIdToDelete })
                     .catch(err => console.warn('[delete-topic] Failed to remove side chats:', err));
@@ -1119,6 +1127,8 @@ function initialize(mainWindow, context) {
                 // 内部元数据仅用于最终请求体生成 vcpchatExtensions，不会进入 messages[]。
                 if (msg.__vcpchatTimestampMeta) sanitizedMsg.__vcpchatTimestampMeta = msg.__vcpchatTimestampMeta;
 
+                if (msg.role === 'user' && msg.__vcpContextCheckpoint === true) sanitizedMsg.__vcpContextCheckpoint = true;
+
                 return sanitizedMsg;
             });
         } catch (validationError) {
@@ -1207,6 +1217,7 @@ function initialize(mainWindow, context) {
                 // 默认不注入元思考链，除非明确开启
                 if (settings.enableThoughtChainInjection !== true) {
                     messages = messages.map(msg => {
+                        if (msg.__vcpContextCheckpoint === true) return msg;
                         if (typeof msg.content === 'string') {
                             return { ...msg, content: contextSanitizer.stripThoughtChains(msg.content) };
                         } else if (Array.isArray(msg.content)) {
@@ -1230,6 +1241,7 @@ function initialize(mainWindow, context) {
             // --- VCP Hidden Tool Results Stripping ---
             try {
                 messages = messages.map(msg => {
+                    if (msg.__vcpContextCheckpoint === true) return msg;
                     if (typeof msg.content === 'string') {
                         return { ...msg, content: contextSanitizer.stripHiddenToolResults(msg.content) };
                     } else if (Array.isArray(msg.content)) {
@@ -1267,7 +1279,11 @@ function initialize(mainWindow, context) {
                     );
 
                     // 重新组合消息数组（保持系统消息在最前面）
-                    messages = [...systemMessages, ...sanitizedNonSystemMessages];
+                    messages = [...systemMessages, ...sanitizedNonSystemMessages.map((message, index) =>
+                        nonSystemMessages[index]?.__vcpContextCheckpoint === true
+                            ? nonSystemMessages[index]
+                            : message
+                    )];
 
                     console.log(`[Context Sanitizer] Messages processed successfully`);
                 }
