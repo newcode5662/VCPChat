@@ -11,6 +11,8 @@ import { createEmoticonUrlFixer } from './renderer/emoticonUrlFixer.js';
 import { createContentPipeline, PIPELINE_MODES } from './renderer/contentPipeline.js';
 import { createContentRuntime } from './chat/contentRuntime.js';
 import { createMermaidPlaceholderTransform } from './chat/contentTransforms.js';
+import { transformChartReferences } from './chat/chartEmbedTransform.js';
+import { createChartEmbedHost } from './renderer/chartEmbedHost.js';
 import { createChatDomRenderer } from './chat/chatDomRenderer.js';
 import { createRenderDependencies } from './renderer/renderDependencies.js';
 import { createRenderSessionAuthority } from './renderer/renderSessionAuthority.js';
@@ -648,20 +650,23 @@ async function renderMermaidDiagrams(container) {
     // Get the list of actual .mermaid elements to render
     const elementsToRender = placeholders.filter(el => el.classList.contains('mermaid'));
 
-    if (elementsToRender.length > 0 && typeof mermaid !== 'undefined') {
-        // Initialize mermaid if it hasn't been already
-        mermaid.initialize({ startOnLoad: false });
-
-        // 逐个渲染以防止单个图表错误导致所有图表显示错误
-        for (const el of elementsToRender) {
-            try {
-                await mermaid.run({ nodes: [el] });
-                enhanceMermaidDiagram(el);
-            } catch (error) {
-                console.error("Error rendering Mermaid diagram:", error);
-                const originalCode = el.dataset.mermaidSource || el.textContent;
-                el.innerHTML = `<div class="mermaid-error">Mermaid 渲染错误: ${error.message}</div><pre>${escapeHtml(originalCode)}</pre>`;
+    for (const el of elementsToRender) {
+        el.classList.add('pele-diagram');
+        const originalCode = el.dataset.mermaidSource || el.textContent;
+        try {
+            if (typeof window.pele === 'undefined' || typeof window.pele.render !== 'function') {
+                throw new Error('本地 Pele 渲染依赖未加载。');
             }
+            if (originalCode.length > 100000) {
+                throw new Error('图表源码超过 100,000 字符限制。');
+            }
+            const { svg } = window.pele.render(originalCode);
+            el.innerHTML = svg;
+            enhanceMermaidDiagram(el);
+        } catch (error) {
+            console.error("Error rendering diagram with Pele:", error);
+            el.classList.add('mermaid-error');
+            el.innerHTML = `<div class="mermaid-error">Pele 图表渲染失败: ${error.message}</div><pre>${escapeHtml(originalCode)}</pre>`;
         }
     }
 }
@@ -694,7 +699,7 @@ function enhanceMermaidDiagram(mermaidElement) {
         <button type="button" class="mermaid-viewer-btn" data-mermaid-action="zoom-out" title="缩小">−</button>
         <button type="button" class="mermaid-viewer-btn" data-mermaid-action="reset" title="重置视图">100%</button>
         <button type="button" class="mermaid-viewer-btn" data-mermaid-action="zoom-in" title="放大">＋</button>
-        <button type="button" class="mermaid-viewer-btn" data-mermaid-action="fit" title="适应宽度">适应</button>
+        <button type="button" class="mermaid-viewer-btn" data-mermaid-action="fit" title="自动适应宽高，完整显示图表">适应</button>
     `;
 
     const viewport = ownerDocument.createElement('div');
@@ -704,7 +709,7 @@ function enhanceMermaidDiagram(mermaidElement) {
     const canvas = ownerDocument.createElement('div');
     canvas.className = 'mermaid-viewer-canvas';
 
-    svg.removeAttribute('style');
+    // 保留 Pele 在 svg.style 中内联的 CSS 变量映射（如 --_s, --_b, --_fg），仅覆盖尺寸以便在视口中自由平移缩放
     svg.style.maxWidth = 'none';
     svg.style.height = 'auto';
     canvas.appendChild(svg);
@@ -721,8 +726,8 @@ function enhanceMermaidDiagram(mermaidElement) {
         translateX: parseFloat(wrapper.dataset.translateX) || 0,
         translateY: parseFloat(wrapper.dataset.translateY) || 0
     });
-    const setState = (nextState) => {
-        const scale = clampScale(nextState.scale);
+    const setState = (nextState, minimumScale = 0.2) => {
+        const scale = Math.min(5, Math.max(minimumScale, nextState.scale));
         wrapper.dataset.scale = String(scale);
         wrapper.dataset.translateX = String(nextState.translateX || 0);
         wrapper.dataset.translateY = String(nextState.translateY || 0);
@@ -741,18 +746,28 @@ function enhanceMermaidDiagram(mermaidElement) {
         });
     };
     const resetView = () => setState({ scale: 1, translateX: 0, translateY: 0 });
-    const fitToWidth = () => {
-        const svgWidth = svg.getBBox?.().width || svg.viewBox?.baseVal?.width || svg.getBoundingClientRect().width;
+    const fitToViewport = () => {
+        // 按最终 DOM 的实际显示尺寸测量，而非 SVG 内部坐标；
+        // 通过画布实际缩放消除当前缩放（包括过渡动画）的影响。
+        const canvasRect = canvas.getBoundingClientRect();
+        const svgRect = svg.getBoundingClientRect();
+        const renderedScale = canvas.offsetWidth > 0 ? canvasRect.width / canvas.offsetWidth : 0;
+        if (!(renderedScale > 0) || !(svgRect.width > 0) || !(svgRect.height > 0)
+            || !(viewport.clientWidth > 0) || !(viewport.clientHeight > 0)) return;
+
+        const svgWidth = svgRect.width / renderedScale;
+        const svgHeight = svgRect.height / renderedScale;
+        const offsetX = (svgRect.left - canvasRect.left) / renderedScale;
+        const offsetY = (svgRect.top - canvasRect.top) / renderedScale;
         const availableWidth = Math.max(1, viewport.clientWidth - 32);
-        if (!svgWidth) {
-            resetView();
-            return;
-        }
+        const availableHeight = Math.max(1, viewport.clientHeight - 32);
+        // 较小的比例自动决定适应宽度还是高度，超长图不受手动缩放的 20% 下限限制。
+        const scale = Math.min(1.8, availableWidth / svgWidth, availableHeight / svgHeight);
         setState({
-            scale: clampScale(Math.min(1.8, availableWidth / svgWidth)),
-            translateX: 0,
-            translateY: 0
-        });
+            scale,
+            translateX: (viewport.clientWidth - svgWidth * scale) / 2 - offsetX * scale,
+            translateY: (viewport.clientHeight - svgHeight * scale) / 2 - offsetY * scale
+        }, Math.min(0.2, scale));
     };
 
 
@@ -768,7 +783,7 @@ function enhanceMermaidDiagram(mermaidElement) {
         if (action === 'zoom-in') zoomAt(scale * 1.2);
         else if (action === 'zoom-out') zoomAt(scale / 1.2);
         else if (action === 'reset') resetView();
-        else if (action === 'fit') fitToWidth();
+        else if (action === 'fit') fitToViewport();
     });
 
     listen(viewport, 'wheel', (event) => {
@@ -822,12 +837,9 @@ function enhanceMermaidDiagram(mermaidElement) {
         resetView();
     });
 
-    const ownerWindow = ownerDocument.defaultView;
-    const requestFrame = ownerWindow?.requestAnimationFrame?.bind(ownerWindow) || ((callback) => ownerWindow?.setTimeout?.(() => callback(Date.now()), 0));
-    wrapper._vcpFitRaf = requestFrame?.(() => {
-        delete wrapper._vcpFitRaf;
-        if (wrapper.isConnected) fitToWidth();
-    });
+    // 初始视图固定为 100%，仅在用户点击“适应”时自动匹配视口宽高。
+    // 历史加载期间容器可能尚未完成布局，不应据此覆盖默认缩放。
+    resetView();
 }
 
 function cleanupMermaidViewers(contentDiv) {
@@ -835,12 +847,6 @@ function cleanupMermaidViewers(contentDiv) {
         wrapper._vcpDisposers?.splice(0).forEach(dispose => {
             try { dispose(); } catch { /* listener already removed */ }
         });
-        if (wrapper._vcpFitRaf) {
-            const ownerWindow = wrapper.ownerDocument?.defaultView;
-            if (typeof ownerWindow?.cancelAnimationFrame === 'function') ownerWindow.cancelAnimationFrame(wrapper._vcpFitRaf);
-            else ownerWindow?.clearTimeout?.(wrapper._vcpFitRaf);
-            delete wrapper._vcpFitRaf;
-        }
         const viewport = wrapper.querySelector('.mermaid-viewer-viewport');
         const pointerId = wrapper._vcpPointerId;
         if (pointerId !== undefined && viewport?.hasPointerCapture?.(pointerId)) {
@@ -2696,7 +2702,10 @@ let contentPipeline = null;
 let contentRuntime = null;
 let rendererListenerDisposers = [];
 let toolPresentation = null;
+let chartEmbedHost = null;
 function disposeRendererListeners() {
+    chartEmbedHost?.dispose();
+    chartEmbedHost = null;
     toolPresentation?.dispose();
     toolPresentation = null;
     rendererListenerDisposers.splice(0).reverse().forEach(dispose => { try { dispose(); } catch (error) { console.warn('[MessageRenderer] listener dispose failed:', error); } });
@@ -2786,6 +2795,7 @@ function cleanupMessageDomResources(messageItem, messageId = null) {
     cleanupToolResultFullContentForRoot(messageItem);
     const contentDiv = messageItem.querySelector('.md-content');
     if (contentDiv) {
+        chartEmbedHost?.beforeReplace(contentDiv);
         imageHandler.cleanupContent?.(contentDiv);
         if (contentDiv._vcpDeferredHighlightTimer) {
             clearTimeout(contentDiv._vcpDeferredHighlightTimer);
@@ -2849,6 +2859,7 @@ function removeMessageById(messageId, saveHistory = false, root = mainRendererRe
 function clearChat(root = mainRendererReferences.chatMessagesDiv) {
     projectForgeTopicSurface.clear(root);
     invalidateRenderSession(root);
+    chartEmbedHost?.clear();
     mainRendererReferences.uiHelper.resetChatScrollFollow?.();
 
     // 清空聊天通常意味着用户希望释放当前渲染上下文占用；HTML 字符串缓存不持有 DOM，但这里主动释放更保守。
@@ -2877,6 +2888,10 @@ function clearChat(root = mainRendererReferences.chatMessagesDiv) {
 function initializeMessageRenderer(refs) {
     disposeRendererListeners();
     mainRendererReferences = createRenderDependencies(refs);
+    chartEmbedHost = createChartEmbedHost({
+        root: mainRendererReferences.chatMessagesDiv,
+        api: mainRendererReferences.electronAPI,
+    });
     mainRendererReferences.chatMessagesDiv.setAttribute('data-vcp-projectforge-root', '');
     projectForgeTopicSurface.replaceHistory(mainRendererReferences.chatMessagesDiv, mainRendererReferences.currentChatHistoryRef.get());
 
@@ -2897,7 +2912,8 @@ function initializeMessageRenderer(refs) {
             }
             return mainRendererReferences.flowlockProtocol.transformForRender(text);
         },
-        transformMermaidPlaceholders: createMermaidPlaceholderTransform({ escapeHtml }),
+        transformMermaidPlaceholders: text =>
+            createMermaidPlaceholderTransform({ escapeHtml })(transformChartReferences(text)),
         getToolResultRegex: () => TOOL_RESULT_REGEX,
         getToolRequestRegex: () => TOOL_REGEX,
         replaceToolRequestBlocks,
@@ -3725,6 +3741,7 @@ async function renderPostProcessedHtml(contentDiv, rawHtml, options = {}) {
     };
 
     if (typeof rawHtml === 'string') {
+        chartEmbedHost?.beforeReplace(contentDiv);
         toolPresentation?.capture(contentDiv);
         // 替换 innerHTML 前必须释放旧子树上的预览 iframe、window message 监听器、
         // 动画/WebGL 资源及大工具结果完整文本。
@@ -3762,6 +3779,8 @@ async function renderPostProcessedHtml(contentDiv, rawHtml, options = {}) {
     // 原生 audio 负责媒体播放，自定义控件层负责一致的主题与交互。
     // 放在附件渲染之后，可同时覆盖 Markdown HTML 音频和消息附件音频。
     enhanceAudioPlayers(contentDiv);
+
+    chartEmbedHost?.scan(contentDiv, { auto: processScripts });
 
     if (!runHeavy) {
         if (messageItem) {

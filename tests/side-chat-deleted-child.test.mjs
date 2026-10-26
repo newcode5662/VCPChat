@@ -29,8 +29,11 @@ function setup() {
         ['../services/senderTaskRegistry', require('../modules/services/senderTaskRegistry.js')],
         ['../contextSanitizer', require('../modules/contextSanitizer.js')],
         ['../modelTrajectory', require('../modules/modelTrajectory.js')],
+        ['../agentMood', require('../modules/agentMood.js')],
         ['../services/attachmentDialogState', {}], ['../../Groupmodules/topicTitleManager', {}],
         ['../services/historyMutationQueue', { HistoryMutationQueue }], ['./workspaceHandlers', {}], ['./sideChatHandlers', sideChatHandlers],
+        // 桌宠没打开时这些钩子全是空操作，用真实模块。
+        ['../hostHooks', require('../modules/hostHooks.js')],
     ]);
     vm.runInNewContext('(function(require,module,exports){' + source + '\n})', { console: { log() {}, warn() {}, error() {} }, TextDecoder, URL, fetch, AbortSignal })(
         name => { assert.ok(dependencies.has(name), 'unreviewed fixture dependency: ' + name); return dependencies.get(name); }, module, module.exports);
@@ -55,10 +58,10 @@ test('a side chat reply that finishes after its child was deleted leaves no orph
     } finally { cleanup(); }
 });
 
-test('reading an ordinary topic that has no directory yet still creates it as before', async () => {
+test('reading an ordinary topic does not create its directory', async () => {
     const { userDataDir, call, cleanup } = setup();
     try {
         assert.equal(JSON.stringify(await call('get-chat-history', 'agent_a', 'topic_1')), '[]');
-        assert.equal(fs.existsSync(path.join(userDataDir, 'agent_a', 'topics', 'topic_1')), true);
+        assert.equal(fs.existsSync(path.join(userDataDir, 'agent_a', 'topics', 'topic_1')), false);
     } finally { cleanup(); }
 });

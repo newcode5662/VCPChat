@@ -10,6 +10,9 @@ const windowService = require('../services/windowService');
 const WINDOW_APP_IDS = require('../services/windowAppIds');
 const { PRELOAD_ROLES, resolveProjectPreload } = require('../services/preloadPaths');
 const AUDIO_ENGINE_URL = 'http://127.0.0.1:63789';
+const musicGrooveBus = require('../services/musicGrooveBus');
+const { formatCurrentLyrics } = require('../lyrics/lyricsMarkdown');
+const { randomUUID } = require('crypto');
 let fetch;
 
 let musicWindow = null;
@@ -177,6 +180,7 @@ function createOrFocusMusicWindow() {
             currentSongInfo = null; // 清理歌曲信息
             musicCapsuleState = { open: false, title: '', trackKey: '', playing: false };
             publishMusicCapsule();
+            musicGrooveBus.publish({ playing: false });
             pendingPlaybackForNewWindow = null; // 清理未消费的待播放请求
         });
 
@@ -223,6 +227,45 @@ async function audioEngineApi(endpoint, method = 'POST', body = null) {
 }
 
 
+// 从当前渲染端读取，兼容 gapless 切歌、手动换词以及 LRC/逐字歌词。
+// 不创建窗口、不联网、不依赖可能滞后的 currentSongInfo。
+async function getCurrentLyrics() {
+    const win = musicWindow;
+    let snapshot = null;
+    if (win && !win.isDestroyed()) {
+        snapshot = await new Promise((resolve, reject) => {
+            const requestId = randomUUID();
+            const cleanup = () => {
+                clearTimeout(timer);
+                ipcMain.removeListener('music-current-lyrics-response', onResponse);
+                win.removeListener('closed', onClosed);
+            };
+            const onClosed = () => { cleanup(); resolve(null); };
+            const onResponse = (event, payload) => {
+                if (event.sender !== win.webContents || payload?.requestId !== requestId) return;
+                cleanup();
+                resolve(payload.snapshot);
+            };
+            const timer = setTimeout(() => {
+                cleanup();
+                reject(new Error('读取当前歌词超时，请稍后重试。'));
+            }, 5000);
+            ipcMain.on('music-current-lyrics-response', onResponse);
+            win.once('closed', onClosed);
+            try {
+                win.webContents.send('music-current-lyrics-request', { requestId });
+            } catch (error) {
+                cleanup();
+                reject(error);
+            }
+        });
+    }
+    return {
+        status: 'success',
+        result: { content: [{ type: 'text', text: formatCurrentLyrics(snapshot) }] }
+    };
+}
+
 // --- Music Control Handler (Legacy, for distributed server) ---
 // 这个函数统一通过前端 renderer 来控制播放，避免竞态问题
 async function handleMusicControl(args) {
@@ -248,6 +291,8 @@ async function handleMusicControl(args) {
     console.log(`[MusicControl] Received command: ${command}, Target: ${target}, Stage mode: ${normalizedStageMode || 'regular'}`);
 
     switch (command.toLowerCase()) {
+        case 'getcurrentlyrics':
+            return getCurrentLyrics();
         case 'play':
             if (target) {
                 // 从播放列表中找到目标曲目
@@ -353,6 +398,10 @@ function initialize(options) {
 
         // --- 前端初始化时拉取待播放请求（解决新窗口点歌竞态问题）---
         ipcMain.handle('music-capsule-get-state', () => musicCapsuleState);
+        ipcMain.on('music-groove-publish', (event, payload) => {
+            if (!musicWindow || musicWindow.isDestroyed() || event.sender !== musicWindow.webContents) return;
+            musicGrooveBus.publish(payload);
+        });
         ipcMain.on('music-capsule-publish', (event, state) => {
             if (!musicWindow || musicWindow.isDestroyed() || event.sender !== musicWindow.webContents) return;
             musicCapsuleState = {
@@ -362,6 +411,7 @@ function initialize(options) {
                 playing: state?.playing === true
             };
             publishMusicCapsule();
+            if (!musicCapsuleState.playing) musicGrooveBus.publish({ playing: false });
         });
         ipcMain.on('music-capsule-command', (event, command) => {
             if (!mainWindow || event.sender !== mainWindow.webContents) return;
