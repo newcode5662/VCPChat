@@ -31,6 +31,8 @@ module.exports = {
         mineruOpenDir: invoke('mineru:open-dir', 'paperId'),
         mineruOpenExternal: invoke('mineru:open-external', 'url'),
         onMineruJob: on('mineru:job'),
+        onMineruJobsChanged: on('mineru:jobs-changed'),
+        onMineruRecoveryWarning: on('mineru:recovery-warning'),
         onMineruLibraryChanged: on('mineru:library-changed'),
     },
 };
