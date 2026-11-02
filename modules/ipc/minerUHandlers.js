@@ -112,8 +112,8 @@ function registerChannels() {
         return { config: saved, status: service.getStatus() };
     });
 
-    handle('mineru:scan', () => service.scanLibrary(true));
-    handle('mineru:get-paper', (_event, paperId) => service.getPaperDetail(paperId));
+    handle('mineru:scan', () => service.refreshLibrary());
+    handle('mineru:get-paper', (_event, paperId) => service.fetchPaperDetail(paperId));
     handle('mineru:read-pdf', (_event, paperId) => service.readPdf(paperId));
 
     handle('mineru:pick-pdfs', event => pickPdfFiles(event));
@@ -189,10 +189,12 @@ function initialize(options = {}) {
     registerChannels();
     disposers = [
         service.on('job', payload => sendToWorkbench('mineru:job', payload)),
+        service.on('jobs-changed', payload => sendToWorkbench('mineru:jobs-changed', payload)),
+        service.on('job-recovery-warning', payload => sendToWorkbench('mineru:recovery-warning', payload)),
         service.on('library-changed', payload => sendToWorkbench('mineru:library-changed', payload)),
     ];
     app.once('will-quit', () => {
-        service.cancelAll();
+        service.suspendAll();
         for (const dispose of disposers) dispose();
         disposers = [];
     });
@@ -206,7 +208,7 @@ function registerScheme(protocol) {
 function dispose() {
     for (const disposeListener of disposers) disposeListener();
     disposers = [];
-    service.cancelAll();
+    service.suspendAll();
 }
 
 module.exports = {

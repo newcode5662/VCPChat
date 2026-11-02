@@ -32,6 +32,8 @@ const JOB_LABEL = {
     timeout: '待续查',
     failed: '失败',
     cancelled: '已停止',
+    interrupted: '待恢复',
+    observed: '外部/遗留记录',
 };
 
 const state = {
@@ -208,6 +210,12 @@ function renderStatusChip() {
         chip.classList.add('error');
         text.textContent = '未连接 VCPToolBox';
         chip.title = status.error || '';
+        return;
+    }
+    if (status.jobRecovery?.warning) {
+        chip.classList.add('warn');
+        text.textContent = status.jobRecovery.blocked ? '任务快照需核查' : '任务恢复保存异常';
+        chip.title = status.jobRecovery.warning;
         return;
     }
     if (!status.tokenConfigured) {
@@ -465,6 +473,7 @@ function renderHeader(detail) {
     } else {
         addAction('打开 PDF', () => { void openPdf(paper.paperId); });
         addAction('更换 PDF', () => { void linkPdf(paper.paperId); });
+        addAction('解除 PDF 关联', () => { void unlinkPdf(paper.paperId); });
     }
     addAction('在文件夹中显示', () => { void revealPaper(paper.paperId); });
     if (['running', 'timeout', 'failed'].includes(paper.group)) {
@@ -528,6 +537,22 @@ async function linkPdf(paperId) {
     }
 }
 
+async function unlinkPdf(paperId) {
+    const ok = await confirmAction(
+        '解除 PDF 阅读关联',
+        '只停用该文献的本机 PDF 阅读关联，不删除 PDF 文件，也不改变原始解析来源。可随时重新关联。',
+        '解除关联',
+    );
+    if (!ok) return;
+    try {
+        await call(api.mineruClearPdfMapping(paperId));
+        toast('PDF 阅读关联已停用，文件未删除', 'success');
+        await loadLibrary({ silent: true });
+        await selectPaper(paperId, { reload: true });
+    } catch (error) {
+        toast(error.message, 'error');
+    }
+}
 async function openPdf(paperId) {
     try {
         await call(api.mineruOpenPdf(paperId));
@@ -890,10 +915,11 @@ function renderJobs() {
     clearNode(list);
     const active = state.jobs.filter(job => ['queued', 'starting', 'running'].includes(job.state)).length;
     const done = state.jobs.filter(job => job.state === 'done').length;
+    const observed = state.jobs.filter(job => job.state === 'observed').length;
     const summary = $('job-summary');
     if (summary) {
         summary.textContent = state.jobs.length
-            ? `${active} 进行中 · ${done} 完成`
+            ? `${active} 本地进行中 · ${done} 完成 · ${observed} 外部/遗留记录`
             : '无任务';
     }
     const jobs = state.jobs.slice(0, 24);
@@ -913,7 +939,7 @@ function renderJobs() {
         right.appendChild(statusBadge(
             job.state === 'done' ? 'indexed'
                 : job.state === 'failed' ? 'failed'
-                    : job.state === 'timeout' ? 'timeout'
+                    : ['timeout', 'interrupted', 'observed'].includes(job.state) ? 'timeout'
                         : job.state === 'cancelled' ? 'unknown'
                             : 'running',
             JOB_LABEL[job.state] || job.state,
@@ -925,6 +951,43 @@ function renderJobs() {
                 void cancelJob(job.id);
             });
             right.appendChild(cancel);
+        }
+        if (job.state === 'observed' && job.canContinue) {
+            const query = el('button', {
+                className: 'job-cancel', text: '续查状态',
+                attrs: { type: 'button', title: '仅启动本地续查；不声称接管原进程' },
+            });
+            query.addEventListener('click', event => {
+                event.stopPropagation();
+                void continuePaper(job.paperId);
+            });
+            right.appendChild(query);
+        }
+        if (job.state === 'interrupted') {
+            const resume = el('button', {
+                className: 'job-cancel', text: job.paperId ? '续查状态' : '重新预检',
+                attrs: { type: 'button', title: '不会自动重新上传PDF' },
+            });
+            resume.addEventListener('click', event => {
+                event.stopPropagation();
+                if (job.paperId) {
+                    void continuePaper(job.paperId);
+                } else if (job.path) {
+                    state.import.paths = [job.path];
+                    setTab('import');
+                    void runPreflight();
+                } else {
+                    toast('原文件路径未知，请重新选择 PDF 后预检', 'info');
+                }
+            });
+            const dismiss = el('button', {
+                className: 'job-cancel', text: '移除记录', attrs: { type: 'button' },
+            });
+            dismiss.addEventListener('click', event => {
+                event.stopPropagation();
+                void cancelJob(job.id);
+            });
+            right.append(resume, dismiss);
         }
         row.appendChild(right);
         const msg = el('div', { className: 'msg', text: job.error || job.message || '' });
@@ -979,6 +1042,7 @@ function upsertJob(job, { notify = false } = {}) {
     }
 }
 
+const scheduleJobsReload = debounce(() => { void loadJobs(); }, 150);
 const scheduleLibraryReload = debounce(() => { void loadLibrary({ silent: true }); }, 420);
 const scheduleCurrentReload = debounce(() => {
     if (state.currentId) void selectPaper(state.currentId, { reload: true });
@@ -1497,6 +1561,14 @@ async function init() {
     renderDedupeSummary();
     renderDedupeGroups();
 
+    api.onMineruRecoveryWarning?.(payload => {
+        if (state.status) state.status.jobRecovery = {
+            ...state.status.jobRecovery, warning: payload?.error || '任务快照保存异常',
+        };
+        renderStatusChip();
+        toast(`任务恢复告警：${payload?.error || '请核查任务快照'}`, 'error');
+    });
+    api.onMineruJobsChanged?.(() => scheduleJobsReload());
     api.onMineruJob?.(job => upsertJob(job, { notify: true }));
     api.onMineruLibraryChanged?.(() => scheduleLibraryReload());
     api.windowReady?.('mineru-workbench');

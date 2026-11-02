@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { installBindingRunner } from './helpers/mineru-binding-runner.mjs';
 
 const service = (await import('../modules/services/minerU/minerUService.js')).default;
 const protocol = (await import('../modules/services/minerU/minerUProtocol.js')).default;
@@ -47,7 +48,8 @@ function waitFor(predicate, { timeout = 3000, interval = 10 } = {}) {
                 reject(new Error('waitFor timeout'));
             }
         }, interval);
-        timer.unref?.();
+        // This timer owns the awaited test promise. Keep it referenced:
+        // mocked child processes do not keep Node's event loop alive.
     });
 }
 
@@ -348,10 +350,11 @@ test('PDF mapping ignores missing files and rejects invalid ids', async t => {
     writePaper(toolboxRoot, `Demo__${PAPER_ID}`, PAPER_ID);
     assert.equal(service.readPdf(PAPER_ID).available, false);
     assert.throws(() => service.readPdf('bad-id'), /格式不正确/);
-    assert.throws(() => service.setPdfMapping(PAPER_ID, path.join(sandbox, 'missing.pdf')), /存在的 PDF/);
+    await assert.rejects(service.setPdfMapping(PAPER_ID, path.join(sandbox, 'missing.pdf')), /存在的 PDF/);
+    installBindingRunner(service);
 
     const real = pdf('with space 中文.pdf');
-    const mapping = service.setPdfMapping(PAPER_ID, real);
+    const mapping = await service.setPdfMapping(PAPER_ID, real);
     assert.equal(mapping.pdfName, 'with space 中文.pdf');
     const data = service.readPdf(PAPER_ID);
     assert.equal(data.available, true);
@@ -361,14 +364,14 @@ test('PDF mapping ignores missing files and rejects invalid ids', async t => {
     const hugePdf = path.join(sandbox, 'huge.pdf');
     fs.writeFileSync(hugePdf, '%PDF-1.4');
     fs.truncateSync(hugePdf, 129 * 1024 * 1024);
-    service.setPdfMapping(PAPER_ID, hugePdf);
+    await service.setPdfMapping(PAPER_ID, hugePdf);
     assert.throws(() => service.readPdf(PAPER_ID), /128MB.*打开 PDF/);
 
     // 手工写入失效映射后，读取必须回落到“不可用”而不是抛异常
     writeJson(path.join(sandbox, 'AppData', 'MinerU', 'pdf-map.json'), {
         [PAPER_ID]: path.join(sandbox, 'gone.pdf'),
     });
-    service.clearPdfMapping('paper_ffffffffffffffff');
+    await service.clearPdfMapping(PAPER_ID);
     service.scanLibrary(true);
     assert.equal(service.readPdf(PAPER_ID).available, false);
 });
@@ -416,4 +419,351 @@ test('unwritable AppData does not block startup', async t => {
     const status = service.getStatus();
     assert.equal(status.ok, true, '配置目录异常不应影响插件环境探测');
     assert.throws(() => service.saveConfig({ toolboxRoot, workers: 2 }));
+});
+
+test('PDF writes reject old backend, identity mismatch, conflict and foreign receipts without legacy fallback', async t => {
+    const { sandbox, toolboxRoot, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    const dir = writePaper(toolboxRoot, `Binding__${PAPER_ID}`, PAPER_ID);
+    const file = pdf('binding.pdf');
+    const legacyPath = path.join(sandbox, 'AppData', 'MinerU', 'pdf-map.json');
+    writeJson(legacyPath, { [PAPER_ID]: file });
+    const original = fs.readFileSync(legacyPath);
+    const probe = { ok: true, data: { paper_id: PAPER_ID, binding_revision: 'missing' } };
+    let calls = [];
+    const runner = fn => service._test.setCommandRunner(async request => {
+        calls.push(request);
+        return fn(request);
+    });
+    runner(() => ({ ok: false, error: 'unknown command get_pdf_binding' }));
+    await assert.rejects(service.setPdfMapping(PAPER_ID, file), /BACKEND_UNAVAILABLE/);
+    await assert.rejects(service.clearPdfMapping(PAPER_ID), /BACKEND_UNAVAILABLE/);
+    calls = [];
+    runner(request => request.command === 'get_pdf_binding' ? probe
+        : { ok: true, data: { paper_id: PAPER_ID, can_apply: false } });
+    await assert.rejects(service.setPdfMapping(PAPER_ID, file), /IDENTITY_UNVERIFIED/);
+    assert.equal(calls.filter(call => call.apply).length, 0);
+    calls = [];
+    runner(request => request.command === 'get_pdf_binding' ? probe
+        : request.apply ? { ok: false, error: 'BINDING_REVISION_CONFLICT' }
+        : { ok: true, data: { paper_id: PAPER_ID, can_apply: true, sha256: 'digest', binding_revision: 'old' } });
+    await assert.rejects(service.setPdfMapping(PAPER_ID, file), /REVISION_CONFLICT/);
+    assert.equal(calls.filter(call => call.apply).length, 1, 'conflict must not retry');
+    runner(() => ({ ok: true, data: { paper_id: 'paper_other', binding_revision: 'missing' } }));
+    await assert.rejects(service.setPdfMapping(PAPER_ID, file), /身份不匹配/);
+    assert.deepEqual(fs.readFileSync(legacyPath), original);
+    assert.equal(fs.existsSync(path.join(dir, 'pdf-binding.json')), false);
+});
+
+test('machine library preserves canonical state, rejects partial snapshots and ignores late responses', async t => {
+    const { sandbox, toolboxRoot } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    writePaper(toolboxRoot, `Machine__${PAPER_ID}`, PAPER_ID);
+    const view = title => ({
+        schema: 'mineru.library-view', schema_version: 1,
+        complete: true, truncated: false, revision: 'a'.repeat(64), total: 1,
+        papers: [{
+            paper_id: PAPER_ID, asset_dir: `Machine__${PAPER_ID}`, duplicate_dirs: [],
+            title, status: 'timeout', state: 'timeout', has_index: false, has_state: true,
+            file_name: 'demo.pdf', source_path: null,
+        }],
+    });
+    service._test.setCommandRunner(async request => {
+        assert.equal(request.command, 'library_view');
+        return { ok: true, data: view('Canonical') };
+    });
+    const first = await service.refreshLibrary();
+    assert.equal(first[0].group, 'timeout', 'must not infer indexed from the existing local index');
+    assert.equal(service.getRecord(PAPER_ID).hasIndex, false);
+    assert.equal(service.scanLibrary(true)[0].title, 'Canonical');
+    service._test.setCommandRunner(async () => ({ ok: true, data: { ...view('Partial'), complete: false } }));
+    await assert.rejects(service.refreshLibrary(), /LIBRARY_VIEW_INVALID/);
+    assert.equal(service.getRecord(PAPER_ID).title, 'Canonical');
+    const pending = [];
+    service._test.setCommandRunner(() => new Promise(resolve => pending.push(resolve)));
+    const slow = service.refreshLibrary();
+    const rejectedSlow = assert.rejects(slow, /SUPERSEDED/);
+    const fast = service.refreshLibrary();
+    pending[1]({ ok: true, data: view('Newest') });
+    await fast;
+    pending[0]({ ok: true, data: view('Stale') });
+    await rejectedSlow;
+    assert.equal(service.getRecord(PAPER_ID).title, 'Newest');
+});
+
+test('parse completion refreshes machine metadata and keeps sync errors separate', async t => {
+    const { sandbox, toolboxRoot, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    writePaper(toolboxRoot, `Finish__${PAPER_ID}`, PAPER_ID);
+    const view = title => ({
+        schema: 'mineru.library-view', schema_version: 1,
+        complete: true, truncated: false, revision: 'b'.repeat(64), total: 1,
+        papers: [{ paper_id: PAPER_ID, asset_dir: `Finish__${PAPER_ID}`,
+            duplicate_dirs: [], title, status: 'indexed', state: 'indexed',
+            has_index: true, has_state: true, source_path: null }],
+    });
+    let views = 0;
+    let failRefresh = false;
+    service._test.setCommandRunner(async request => {
+        if (request.command === 'library_view') {
+            views++;
+            return failRefresh ? { ok: false, error: 'metadata temporarily unavailable' }
+                : { ok: true, data: view(views > 1 ? 'After parse' : 'Before parse') };
+        }
+        assert.equal(request.command, 'parse');
+        return { ok: true, data: { paper_id: PAPER_ID } };
+    });
+    await service.refreshLibrary();
+    const [first] = service.startParse([{ path: pdf('first.pdf'), paperId: PAPER_ID }]);
+    await waitFor(() => service.listJobs().find(job => job.id === first.id)?.state === 'done');
+    assert.equal(views, 2);
+    assert.equal(service.getRecord(PAPER_ID).title, 'After parse');
+    const warnings = [];
+    const dispose = service.on('library-refresh-error', warning => warnings.push(warning));
+    t.after(dispose);
+    failRefresh = true;
+    const [second] = service.startParse([{ path: pdf('second.pdf'), paperId: PAPER_ID }]);
+    await waitFor(() => service.listJobs().find(job => job.id === second.id)?.state === 'done');
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0].error, /metadata temporarily unavailable/);
+    assert.equal(service.getRecord(PAPER_ID).title, 'After parse', 'retain last metadata on refresh failure');
+});
+
+test('paper metadata comes from backend, local body stays local and superseded details reject', async t => {
+    const { sandbox, toolboxRoot } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    const leaf = `Detail__${PAPER_ID}`;
+    const dir = writePaper(toolboxRoot, leaf, PAPER_ID);
+    fs.writeFileSync(path.join(dir, 'full.md'), '# Local scientific text');
+    const paper = {
+        paper_id: PAPER_ID, asset_dir: leaf, duplicate_dirs: [],
+        title: 'Backend title', status: 'indexed', state: 'indexed',
+        has_index: true, has_state: false,
+    };
+    const detail = {
+        schema: 'mineru.paper-view', schema_version: 1, complete: true, truncated: false,
+        revision: 'c'.repeat(64), paper, state: null,
+        index: { paper_id: PAPER_ID, title: 'Backend title', images: [],
+            outline: [{ text: 'Backend outline' }], errors: [], warnings: [] },
+    };
+    fs.writeFileSync(path.join(dir, 'index.json'), '{local index not used by this IPC}');
+    service._test.setCommandRunner(async request => {
+        assert.equal(request.command, 'paper_view');
+        return { ok: true, data: detail };
+    });
+    const result = await service.fetchPaperDetail(PAPER_ID);
+    assert.equal(result.index.title, 'Backend title');
+    assert.equal(result.index.outline[0].text, 'Backend outline');
+    assert.equal(result.markdown, '# Local scientific text');
+    let finish;
+    service._test.setCommandRunner(request => request.command === 'paper_view'
+        ? new Promise(resolve => { finish = resolve; })
+        : Promise.resolve({ ok: true, data: {
+            schema: 'mineru.library-view', schema_version: 1, complete: true, truncated: false,
+            revision: 'd'.repeat(64), total: 1, papers: [paper],
+        } }));
+    const pending = service.fetchPaperDetail(PAPER_ID);
+    const rejected = assert.rejects(pending, /PAPER_VIEW_SUPERSEDED/);
+    await service.refreshLibrary();
+    finish({ ok: true, data: detail });
+    await rejected;
+});
+
+test('service restart parks scoped jobs without executing commands or restoring runtime handles', async t => {
+    const { sandbox, toolboxRoot, appDataRoot, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    let executions = 0;
+    service._test.setCommandRunner(() => { executions++; return new Promise(() => {}); });
+    const created = service.startParse([pdf('restart-a.pdf'), pdf('restart-b.pdf'), pdf('restart-c.pdf')]);
+    assert.equal(executions, 2);
+    const recoveryFile = service.getStatus().jobRecovery.file;
+    const raw = fs.readFileSync(recoveryFile);
+    const saved = JSON.parse(raw);
+    assert.equal(saved.jobs.length, 3);
+    assert(!raw.toString().includes('"pid"'));
+    service._test.reset(); // simulate losing runtime state, no graceful cancel
+    executions = 0;
+    service._test.setCommandRunner(() => { executions++; throw Error('must not execute during recovery'); });
+    service._test.reinitialize({ appDataRoot, projectRoot: path.join(sandbox, 'VCPChat') });
+    const recovered = service.listJobs();
+    assert.equal(recovered.length, 3);
+    assert.deepEqual(recovered.map(j => j.id), created.map(j => j.id));
+    assert(recovered.every(j => j.state === 'interrupted' && j.recovered && j.recoveryAction === 'review_import'));
+    assert.equal(service._test.activeJobCount(), 0);
+    assert.equal(executions, 0);
+    service.cancelAll();
+    assert.equal(executions, 0);
+    assert(recovered.every(j => j.pid === undefined));
+    const otherRoot = path.join(sandbox, 'OtherToolBox');
+    fs.cpSync(path.join(toolboxRoot, 'Plugin'), path.join(otherRoot, 'Plugin'), { recursive: true });
+    service.saveConfig({ toolboxRoot: otherRoot });
+    assert.equal(service.listJobs().length, 0);
+    assert.notEqual(service.getStatus().jobRecovery.file, recoveryFile);
+    service.saveConfig({ toolboxRoot });
+    assert.equal(service.listJobs().length, 3);
+    assert.equal(executions, 0);
+    assert.deepEqual(fs.readFileSync(recoveryFile), raw, 'restore must not rewrite historical snapshot');
+});
+test('corrupt service recovery file remains untouched and blocks silent replacement', async t => {
+    const { sandbox, appDataRoot, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    const file = service.getStatus().jobRecovery.file;
+    fs.writeFileSync(file, '{corrupt original evidence');
+    let calls = 0;
+    service._test.setCommandRunner(() => { calls++; return Promise.resolve({ ok: false }); });
+    service._test.reinitialize({ appDataRoot, projectRoot: path.join(sandbox, 'VCPChat') });
+    assert.equal(service.getStatus().jobRecovery.blocked, true);
+    assert.match(service.getStatus().jobRecovery.warning, /禁止覆盖/);
+    assert.throws(() => service.startParse([pdf('blocked.pdf')]), /禁止覆盖/);
+    assert.equal(calls, 0);
+    assert.equal(fs.readFileSync(file, 'utf8'), '{corrupt original evidence');
+});
+
+test('graceful suspension parks work, late child exit cannot cancel it or start replacements', async t => {
+    const { sandbox, toolboxRoot, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    const pending = [];
+    let starts = 0;
+    let kills = 0;
+    service._test.setCommandRunner((_request, { onChild } = {}) => {
+        starts++;
+        onChild?.({ kill() { kills++; } });
+        return new Promise(resolve => pending.push(resolve));
+    });
+    const created = service.startParse([
+        { path: pdf('park-a.pdf'), paperId: PAPER_ID },
+        pdf('park-b.pdf'), pdf('park-c.pdf'),
+    ]);
+    assert.throws(() => service.saveConfig({ toolboxRoot: '' }), /不能清空/);
+    service.suspendAll();
+    assert.equal(starts, 2);
+    assert.equal(kills, 2);
+    assert(service.listJobs().every(job => job.state === 'interrupted'));
+    assert.equal(service.listJobs()[0].recoveryAction, 'query');
+    pending.forEach(resolve => resolve({ ok: false, error: 'terminated' }));
+    await waitFor(() => service._test.activeJobCount() === 0);
+    assert.equal(starts, 2, 'queued replacement must never start');
+    assert(service.listJobs().every(job => job.state === 'interrupted'));
+    const disk = JSON.parse(fs.readFileSync(service.getStatus().jobRecovery.file, 'utf8'));
+    assert(disk.jobs.every(job => job.state === 'interrupted'));
+    service.cancelJob(created[0].id);
+    assert.equal(service.listJobs()[0].state, 'cancelled');
+    assert.equal(kills, 2, 'dismissing recovery must not kill any historical PID');
+    assert.equal(service.getStatus().toolboxRoot, toolboxRoot);
+});
+test('snapshot write failure is exposed separately without corrupting prior recovery bytes', async t => {
+    const { sandbox, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    const file = service.getStatus().jobRecovery.file;
+    fs.writeFileSync(file, 'last-known-snapshot');
+    fs.writeFileSync(`${file}.lock`, 'other', { flag: 'wx' });
+    const warnings = [];
+    t.after(service.on('job-recovery-warning', warning => warnings.push(warning)));
+    service._test.setCommandRunner(() => new Promise(() => {}));
+    service.startParse([pdf('warning.pdf')]);
+    assert(warnings.length >= 1);
+    assert.match(service.getStatus().jobRecovery.warning, /EEXIST/);
+    assert.equal(fs.readFileSync(file, 'utf8'), 'last-known-snapshot');
+    assert.equal(fs.readFileSync(`${file}.lock`, 'utf8'), 'other');
+});
+
+test('external pending records are read-only observations, queries are explicit and deduplicated', async t => {
+    const { sandbox, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    const otherId = 'paper_external00000000';
+    const papers = [PAPER_ID, otherId].map(id => ({
+        paper_id: id, asset_dir: `Pending__${id}`, duplicate_dirs: [],
+        title: id, status: 'timeout', state: 'timeout', batch_id: `batch-${id}`,
+        has_index: false, has_state: true, source_path: null,
+    }));
+    const view = { schema: 'mineru.library-view', schema_version: 1,
+        complete: true, truncated: false, revision: 'e'.repeat(64), total: 2, papers };
+    let queries = 0;
+    let parses = 0;
+    const pending = [];
+    service._test.setCommandRunner(request => {
+        if (request.command === 'library_view') return Promise.resolve({ ok: true, data: view });
+        if (request.command === 'query') {
+            queries++;
+            return new Promise(resolve => pending.push(resolve));
+        }
+        parses++;
+        throw Error('must not upload');
+    });
+    await service.refreshLibrary();
+    assert.equal(queries, 0);
+    assert.equal(parses, 0);
+    let list = service.listJobs();
+    assert.equal(list.length, 2);
+    assert(list.every(job => job.state === 'observed' && job.source === 'library_state'));
+    assert.equal(service._test.activeJobCount(), 0);
+    assert.throws(() => service.cancelJob(list[0].id), /任务不存在/);
+    assert.throws(() => service.startParse([{ path: pdf('pending.pdf'), paperId: PAPER_ID }]),
+        /PAPER_HAS_PENDING_TASK/);
+    const [local] = service.continuePapers([PAPER_ID]);
+    assert.equal(queries, 1);
+    assert.equal(parses, 0);
+    list = service.listJobs();
+    assert.equal(list.filter(job => job.paperId === PAPER_ID).length, 1);
+    assert.equal(list.find(job => job.id === local.id).source, 'local');
+    assert.equal(list.filter(job => job.state === 'observed').length, 1);
+    assert.throws(() => service.continuePapers([PAPER_ID]), /DUPLICATE_ACTIVE_JOB/);
+    assert.equal(queries, 1);
+    const snapshot = JSON.parse(fs.readFileSync(service.getStatus().jobRecovery.file, 'utf8'));
+    assert.equal(snapshot.jobs.length, 1);
+    assert.equal(snapshot.jobs[0].type, 'query');
+    assert(snapshot.jobs.every(job => job.state !== 'observed'));
+    service.cancelAll();
+    pending.forEach(resolve => resolve({ ok: false, error: 'test cancelled' }));
+    await waitFor(() => service._test.activeJobCount() === 0);
+});
+test('duplicate local PDF paths are rejected across submissions without partially enqueueing batch', async t => {
+    const { sandbox, pdf } = setup();
+    service._test.reset();
+    t.after(() => {
+        service._test.reset();
+        fs.rmSync(sandbox, { recursive: true, force: true });
+    });
+    service._test.setCommandRunner(() => new Promise(() => {}));
+    const existing = pdf('existing.pdf');
+    const other = pdf('new.pdf');
+    service.startParse([existing]);
+    assert.throws(() => service.startParse([other, existing]), /DUPLICATE_ACTIVE_JOB/);
+    assert.equal(service.listJobs().length, 1);
 });

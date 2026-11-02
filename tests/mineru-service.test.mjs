@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { installBindingRunner } from './helpers/mineru-binding-runner.mjs';
 
 const service = (await import('../modules/services/minerU/minerUService.js')).default;
 const protocol = (await import('../modules/services/minerU/minerUProtocol.js')).default;
@@ -125,7 +126,10 @@ test('MinerU service scans assets, serves images, and reads mapped PDFs', async 
     assert.deepEqual(protocol.parseAssetUrl(url), { paperId: PAPER_ID, rel: 'images/a.png' });
     assert.equal(protocol.parseAssetUrl('vcp-mineru://image/paper_x/../../secret.png'), null);
 
-    const mapping = service.setPdfMapping(PAPER_ID, pdfPath);
+    const bindingCalls = installBindingRunner(service);
+    const mapping = await service.setPdfMapping(PAPER_ID, pdfPath);
+    assert.deepEqual(bindingCalls.map(call => call.command), ['get_pdf_binding', 'link_pdf', 'link_pdf']);
+    assert.equal(fs.existsSync(path.join(appDataRoot, 'MinerU', 'pdf-map.json')), false);
     assert.equal(mapping.pdfPath, pdfPath);
     const withPdf = service.getPaperDetail(PAPER_ID);
     assert.equal(withPdf.pdfAvailable, true);
@@ -134,6 +138,29 @@ test('MinerU service scans assets, serves images, and reads mapped PDFs', async 
     assert.equal(pdf.available, true);
     assert.equal(pdf.size, Buffer.byteLength('%PDF-1.4 test'));
     assert.equal(pdf.data.toString(), '%PDF-1.4 test');
-    service.clearPdfMapping(PAPER_ID);
+    await service.clearPdfMapping(PAPER_ID);
     assert.equal(service.getPaperDetail(PAPER_ID).pdfAvailable, false);
+
+    // Backend attachment wins over a still-present legacy mapping.
+    await service.setPdfMapping(PAPER_ID, pdfPath);
+    writeJson(path.join(appDataRoot, 'MinerU', 'pdf-map.json'), { [PAPER_ID]: pdfPath });
+    const bindingPath = path.join(fileDir, 'pdf-binding.json');
+    writeJson(bindingPath, { schema_version: 1, paper_id: PAPER_ID, disabled: true });
+    let current = service.scanLibrary(true)[0];
+    assert.equal(current.pdfAvailable, false);
+    assert.equal(current.pdfBindingStatus, 'disabled');
+    writeJson(bindingPath, { schema_version: 1, paper_id: PAPER_ID, path: pdfPath });
+    current = service.scanLibrary(true)[0];
+    assert.equal(current.pdfAvailable, true);
+    assert.equal(current.pdfBindingStatus, 'bound');
+    writeJson(bindingPath, { schema_version: 1, paper_id: PAPER_ID, path: path.join(sandbox, 'gone.pdf') });
+    current = service.scanLibrary(true)[0];
+    assert.equal(current.pdfAvailable, false);
+    assert.equal(current.pdfBindingStatus, 'unavailable');
+    fs.writeFileSync(bindingPath, '{broken');
+    current = service.scanLibrary(true)[0];
+    assert.equal(current.pdfAvailable, false);
+    assert.equal(current.pdfBindingStatus, 'invalid');
+    fs.unlinkSync(bindingPath);
+    assert.equal(service.scanLibrary(true)[0].pdfAvailable, true);
 });

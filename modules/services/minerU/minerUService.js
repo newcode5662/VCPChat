@@ -11,6 +11,9 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { EventEmitter } = require('events');
 const dotenv = require('dotenv');
+const crypto = require('crypto');
+const jobRecovery = require('./jobRecovery');
+const { observeJobs } = require('./jobObservations');
 
 const PAPER_ID_RE = /^paper_[A-Za-z0-9_-]+$/;
 const MAX_PDF_BYTES = 128 * 1024 * 1024;
@@ -46,8 +49,14 @@ let binaryPath = '';
 let pluginConfig = {};
 let resolutionError = '';
 let libraryCache = { at: 0, records: [] };
+let machineLibrary = null;
+let libraryRefreshSeq = 0;
 let pdfMapCache = { at: 0, map: {} };
 let jobSeq = 0;
+let recoveryScope = '';
+let recoveryFile = '';
+let recoveryWarning = '';
+let recoveryBlocked = false;
 const jobs = new Map();
 const internals = new Map();
 
@@ -444,6 +453,70 @@ function titleFromLeaf(leaf, paperId) {
     return '';
 }
 
+function localPdfAttachment(paperId, dir, sourcePath) {
+    const bindingPath = path.join(dir, 'pdf-binding.json');
+    const hasBinding = fs.existsSync(bindingPath);
+    const binding = hasBinding ? readJson(bindingPath) : null;
+    if (hasBinding) {
+        if (binding?.schema_version !== 1 || binding?.paper_id !== paperId)
+            return { pdfPath: null, pdfBindingStatus: 'invalid' };
+        if (binding.disabled === true) return { pdfPath: null, pdfBindingStatus: 'disabled' };
+        if (typeof binding.path === 'string' && path.isAbsolute(binding.path)
+            && isPdfFile(binding.path) && isExistingFile(binding.path))
+            return { pdfPath: binding.path, pdfBindingStatus: 'bound' };
+        return { pdfPath: null, pdfBindingStatus: 'unavailable' };
+    }
+    const mapped = loadPdfMap()[paperId];
+    const pdfPath = mapped && isExistingFile(mapped) ? mapped
+        : sourcePath && !/^https?:/i.test(sourcePath) && isPdfFile(sourcePath) && isExistingFile(sourcePath)
+            ? sourcePath : null;
+    return { pdfPath, pdfBindingStatus: 'legacy' };
+}
+
+function localizeMachineRecord(paper) {
+    const fileDir = path.join(toolboxRoot, 'file', 'mineru', paper.asset_dir);
+    const imageDir = path.join(toolboxRoot, 'image', 'mineru', paper.asset_dir);
+    const attachment = localPdfAttachment(paper.paper_id, fileDir, paper.source_path);
+    return {
+        paperId: paper.paper_id, title: paper.title, leaf: paper.asset_dir,
+        assetDir: paper.asset_dir, fileDir, imageDir: isExistingDir(imageDir) ? imageDir : null,
+        hasIndex: paper.has_index, hasState: paper.has_state,
+        state: paper.state, group: paper.status, status: statusLabel(paper.status),
+        legacyDir: paper.legacy_dir, pages: paper.pages ?? 0, textChars: paper.text_chars ?? 0,
+        imageCount: paper.image_count ?? 0, tableCount: paper.table_count ?? 0,
+        formulaCount: paper.formula_count ?? 0, outlineCount: paper.outline_count ?? 0,
+        imageStats: paper.image_stats ?? null, fileSize: 0,
+        sourcePath: paper.source_path, sourceDir: paper.source_dir,
+        ...attachment, pdfName: attachment.pdfPath ? path.basename(attachment.pdfPath) : '',
+        pdfAvailable: Boolean(attachment.pdfPath), fileName: paper.file_name,
+        batchId: paper.batch_id, progress: paper.progress ? {
+            extracted: paper.progress.extracted_pages, total: paper.progress.total_pages,
+            chunksDone: paper.chunks?.done, chunksTotal: paper.chunks?.total,
+        } : null,
+        error: paper.error, warnings: paper.warnings || [], errors: paper.errors || [],
+        updatedAt: paper.updated_at, createdAt: paper.created_at,
+        renderUrl: null, duplicateDirs: paper.duplicate_dirs,
+    };
+}
+
+async function refreshLibrary() {
+    const seq = ++libraryRefreshSeq;
+    const root = toolboxRoot;
+    const result = await commandRunner({ command: 'library_view' }, { timeoutMs: 60000 });
+    if (!result?.ok) throw new Error(result?.error || '读取后端库视图失败；旧缓存保留。');
+    const { validateLibraryView } = require('./libraryView');
+    const data = validateLibraryView(result.data);
+    if (seq !== libraryRefreshSeq || root !== toolboxRoot) {
+        throw new Error('LIBRARY_VIEW_SUPERSEDED: 环境或请求已变化，请刷新。');
+    }
+    pdfMapCache = { at: 0, map: {} };
+    // Localize before publishing; never replace a valid view with a partial one.
+    const records = data.papers.map(localizeMachineRecord);
+    machineLibrary = { root, data };
+    libraryCache = { at: Date.now(), records };
+    events.emit('jobs-changed', { reason: 'library-observations' });
+    return records;
+}
 function recordFromDir(dir, leaf) {
     const index = readJson(path.join(dir, 'index.json'));
     const state = readJson(path.join(dir, 'state.json'));
@@ -459,14 +532,8 @@ function recordFromDir(dir, leaf) {
     ).trim() || paperId;
     const fileDir = dir;
     const imageDir = path.join(toolboxRoot, 'image', 'mineru', leaf);
-    const pdfMap = loadPdfMap();
-    let sourcePath = index?.source_path || state?.source_path || null;
-    let pdfPath = null;
-    if (pdfMap[paperId] && isExistingFile(pdfMap[paperId])) {
-        pdfPath = pdfMap[paperId];
-    } else if (sourcePath && !/^https?:\/\//i.test(sourcePath) && isPdfFile(sourcePath) && isExistingFile(sourcePath)) {
-        pdfPath = sourcePath;
-    }
+    const sourcePath = index?.source_path || state?.source_path || null;
+    const { pdfPath, pdfBindingStatus } = localPdfAttachment(paperId, dir, sourcePath);
     const progress = progressOf(state);
     return {
         paperId,
@@ -492,6 +559,7 @@ function recordFromDir(dir, leaf) {
         pdfPath,
         pdfName: pdfPath ? path.basename(pdfPath) : '',
         pdfAvailable: Boolean(pdfPath),
+        pdfBindingStatus,
         fileName: index?.file_name || state?.file_name || '',
         batchId: state?.batch_id || index?.batch_id || null,
         progress,
@@ -513,6 +581,11 @@ function preferRecord(a, b) {
 }
 
 function scanLibrary(force = false) {
+    if (force) pdfMapCache = { at: 0, map: {} };
+    if (machineLibrary?.root === toolboxRoot) {
+        // Asset/PDF IO remains synchronous; canonical business metadata is cached.
+        return machineLibrary.data.papers.map(localizeMachineRecord);
+    }
     if (!force && Date.now() - libraryCache.at < 1500) return libraryCache.records;
     if (!toolboxRoot) return [];
     const root = path.join(toolboxRoot, 'file', 'mineru');
@@ -560,12 +633,26 @@ function getRecord(paperId) {
     return scanLibrary().find(record => record.paperId === id) || null;
 }
 
-function getPaperDetail(paperId) {
-    const record = getRecord(paperId);
+async function fetchPaperDetail(paperId) {
+    const id = requirePaperId(paperId);
+    const root = toolboxRoot;
+    const seq = libraryRefreshSeq;
+    const result = await commandRunner({ command: 'paper_view', paper_id: id }, { timeoutMs: 60000 });
+    if (!result?.ok) throw new Error(result?.error || '后端详情读取失败。');
+    const { validatePaperView } = require('./libraryView');
+    const data = validatePaperView(result.data, id);
+    if (root !== toolboxRoot || seq !== libraryRefreshSeq) {
+        throw new Error('PAPER_VIEW_SUPERSEDED: 库环境已刷新，请重试详情。');
+    }
+    const record = localizeMachineRecord(data.paper);
+    return getPaperDetail(id, { record, index: data.index || {}, state: data.state || {} });
+}
+function getPaperDetail(paperId, metadata = null) {
+    const record = metadata?.record || getRecord(paperId);
     if (!record) throw new Error(`未找到论文 ${paperId}。`);
     const dir = record.fileDir;
-    const index = readJson(path.join(dir, 'index.json')) || {};
-    const state = readJson(path.join(dir, 'state.json')) || {};
+    const index = metadata ? metadata.index : readJson(path.join(dir, 'index.json')) || {};
+    const state = metadata ? metadata.state : readJson(path.join(dir, 'state.json')) || {};
     const mdCandidates = ['full.md', 'full.render.md'];
     let markdown = '';
     let markdownSource = '';
@@ -594,6 +681,8 @@ function getPaperDetail(paperId) {
             title: index.title || record.title,
             outline: Array.isArray(index.outline) ? index.outline : [],
             images,
+            imageStats: index.image_stats || null,
+            imageProvenance: Array.isArray(index.image_provenance) ? index.image_provenance : [],
             errors: Array.isArray(index.errors) ? index.errors : [],
             warnings: Array.isArray(index.warnings) ? index.warnings : [],
             mdPath: index.md_path || '',
@@ -673,30 +762,122 @@ function readPdf(paperId) {
     };
 }
 
-function setPdfMapping(paperId, filePath) {
+async function pdfBindingCommand(request) {
+    const result = await commandRunner(request, { timeoutMs: 60000 });
+    if (!result?.ok) {
+        throw new Error(result?.error || 'PDF绑定命令失败；未回退写入旧映射。');
+    }
+    if (!result.data || result.data.paper_id !== request.paper_id) {
+        throw new Error('PDF_BINDING_RECEIPT_INVALID：后端返回论文身份不匹配。');
+    }
+    return result.data;
+}
+
+async function requirePdfBindingBackend(paperId) {
+    // Probe the executable, not just a newer manifest beside an old binary.
+    try {
+        const data = await pdfBindingCommand({ command: 'get_pdf_binding', paper_id: paperId });
+        if (typeof data.binding_revision !== 'string') throw new Error('缺少绑定修订号');
+    } catch (error) {
+        throw new Error(`PDF_BINDING_BACKEND_UNAVAILABLE：请确认 MinerU 二进制支持阅读绑定接口。${error.message}`);
+    }
+}
+async function previewPdfMappingMigration() {
+    const { previewLegacyMappings } = require('./pdfMappingMigration');
+    return previewLegacyMappings(pdfMapPath, pdfBindingCommand);
+}
+async function applyPdfMappingMigration(options) {
+    const { applyLegacyMappings } = require('./pdfMappingMigration');
+    try {
+        return await applyLegacyMappings(pdfMapPath, pdfBindingCommand, options);
+    } finally {
+        // Partial commits or lost receipts also require a fresh library view.
+        invalidateLibrary();
+        events.emit('library-changed', { reason: 'pdf-mapping-migration' });
+    }
+}
+async function setPdfMapping(paperId, filePath) {
     const id = requirePaperId(paperId);
     const resolved = path.resolve(String(filePath || ''));
     if (!isPdfFile(resolved) || !isExistingFile(resolved)) {
         throw new Error('请选择存在的 PDF 文件。');
     }
-    const map = { ...(readJson(pdfMapPath) || {}) };
-    map[id] = resolved;
-    atomicWriteJson(pdfMapPath, map);
-    pdfMapCache = { at: 0, map: {} };
+    await requirePdfBindingBackend(id);
+    const preview = await pdfBindingCommand({
+        command: 'link_pdf', paper_id: id, file_path: resolved,
+    });
+    if (preview.can_apply !== true || typeof preview.sha256 !== 'string'
+        || typeof preview.binding_revision !== 'string') {
+        throw new Error('PDF_IDENTITY_UNVERIFIED：该 PDF 无法自动确认与论文一致；未修改关联。');
+    }
+    const receipt = await pdfBindingCommand({
+        command: 'link_pdf', paper_id: id, file_path: resolved, apply: true,
+        expected_revision: preview.binding_revision, expected_pdf_sha256: preview.sha256,
+    });
+    if (receipt.applied !== true || receipt.binding?.paper_id !== id
+        || typeof receipt.binding.path !== 'string' || receipt.binding.disabled === true) {
+        throw new Error('PDF_BINDING_RECEIPT_INVALID：提交结果不完整，请刷新绑定状态后再操作。');
+    }
     invalidateLibrary();
-    return { paperId: id, pdfPath: resolved, pdfName: path.basename(resolved) };
+    events.emit('library-changed', { paperId: id, reason: 'pdf-binding' });
+    return { paperId: id, pdfPath: receipt.binding.path,
+        pdfName: path.basename(receipt.binding.path), revision: receipt.revision, backup: receipt.backup };
 }
 
-function clearPdfMapping(paperId) {
+async function clearPdfMapping(paperId) {
     const id = requirePaperId(paperId);
-    const map = { ...(readJson(pdfMapPath) || {}) };
-    delete map[id];
-    atomicWriteJson(pdfMapPath, map);
-    pdfMapCache = { at: 0, map: {} };
+    await requirePdfBindingBackend(id);
+    const preview = await pdfBindingCommand({ command: 'unlink_pdf', paper_id: id });
+    if (typeof preview.binding_revision !== 'string') {
+        throw new Error('PDF_BINDING_RECEIPT_INVALID：解绑预演缺少修订号。');
+    }
+    const receipt = await pdfBindingCommand({
+        command: 'unlink_pdf', paper_id: id, apply: true,
+        expected_revision: preview.binding_revision,
+    });
+    if (receipt.applied !== true || receipt.disabled !== true) {
+        throw new Error('PDF_BINDING_RECEIPT_INVALID：解绑结果不完整，请刷新后再操作。');
+    }
     invalidateLibrary();
-    return { paperId: id };
+    events.emit('library-changed', { paperId: id, reason: 'pdf-binding-disabled' });
+    return { paperId: id, revision: receipt.revision, backup: receipt.backup };
 }
 
+function persistJobs() {
+    if (!recoveryFile || !recoveryScope || recoveryBlocked) return;
+    try {
+        const receipt = jobRecovery.write(recoveryFile, recoveryScope, [...jobs.values()].map(serializeJob));
+        recoveryWarning = receipt.cleanupWarnings.join('; ');
+    } catch (error) {
+        recoveryWarning = sanitizeError(error);
+    }
+    if (recoveryWarning) events.emit('job-recovery-warning', { error: recoveryWarning });
+}
+
+function loadJobRecoveryScope() {
+    const root = toolboxRoot ? path.resolve(toolboxRoot) : '';
+    if (root === recoveryScope && recoveryFile) return;
+    jobs.clear();
+    internals.clear();
+    recoveryScope = root;
+    recoveryWarning = '';
+    recoveryBlocked = false;
+    recoveryFile = root ? path.join(configDir,
+        `jobs-${crypto.createHash('sha256').update(root).digest('hex')}.json`) : '';
+    if (!recoveryFile) return;
+    try {
+        const restored = jobRecovery.read(recoveryFile, root);
+        for (const job of restored) {
+            // No internals, PID or process handles are reconstructed.
+            jobs.set(job.id, { ...job, cancelRequested: false, pid: null });
+        }
+    } catch (error) {
+        recoveryBlocked = true;
+        recoveryWarning = `任务快照未加载且禁止覆盖，请先核查 ${recoveryFile}：${sanitizeError(error)}`;
+        events.emit('job-recovery-warning', { error: recoveryWarning });
+    }
+    // Deliberately no pump(): recovery must never upload or query automatically.
+}
 function serializeJob(job) {
     return {
         id: job.id,
@@ -713,21 +894,29 @@ function serializeJob(job) {
         createdAt: job.createdAt,
         startedAt: job.startedAt || null,
         finishedAt: job.finishedAt || null,
+        recovered: job.recovered === true,
+        recoveryAction: job.recoveryAction || null,
+        source: 'local',
     };
 }
 
-function emitJob(job) {
+function emitJob(job, { persist = true } = {}) {
+    if (persist) persistJobs();
     events.emit('job', serializeJob(job));
+    if (persist) events.emit('jobs-changed', { reason: 'local-job-state' });
 }
 
 function listJobs() {
-    return [...jobs.values()].map(serializeJob);
+    const local = [...jobs.values()].map(serializeJob);
+    const papers = machineLibrary?.root === toolboxRoot ? machineLibrary.data.papers : [];
+    return [...local, ...observeJobs(papers, local)];
 }
 
 function isJobActive(job) {
     if (['starting', 'running', 'polling'].includes(job.state)) return true;
     // 已请求取消但子进程尚未退出：仍占用并发槽位
-    return job.state === 'cancelled' && Boolean(internals.get(job.id)?.child);
+    return ['cancelled', 'interrupted'].includes(job.state)
+        && Boolean(internals.get(job.id)?.child);
 }
 
 function activeJobCount() {
@@ -735,6 +924,7 @@ function activeJobCount() {
 }
 
 function terminalJob(job, state, patch = {}) {
+    if (internals.get(job.id)?.suspended) return;
     job.state = state;
     Object.assign(job, patch);
     job.finishedAt = Date.now();
@@ -855,6 +1045,7 @@ async function runJob(job) {
             },
         });
 
+        if (internal.suspended) return;
         if (job.cancelRequested) {
             terminalJob(job, 'cancelled', { message: '已停止本地等待；云端任务可能仍在运行，可稍后续查。' });
             return;
@@ -865,7 +1056,16 @@ async function runJob(job) {
         }
 
         const info = readJobProgress(job, internal);
-        scanLibrary(true);
+        if (machineLibrary?.root === toolboxRoot) {
+            try {
+                await refreshLibrary();
+            } catch (error) {
+                // Metadata synchronization is not the parse operation itself.
+                events.emit('library-refresh-error', { error: sanitizeError(error) });
+            }
+        } else {
+            scanLibrary(true);
+        }
         let record = job.paperId ? getRecord(job.paperId) : null;
         if (!record && job.path) {
             // 没有预检 paper_id 时，用源路径在刚刷新过的库里反查
@@ -948,7 +1148,8 @@ function normalizeItems(items) {
 
 function pruneJobs() {
     const finished = [...jobs.values()]
-        .filter(job => !isJobActive(job))
+        .filter(job => ['done', 'timeout', 'failed', 'cancelled'].includes(job.state)
+            && !isJobActive(job))
         .sort((a, b) => (b.finishedAt || b.createdAt) - (a.finishedAt || a.createdAt));
     for (const job of finished.slice(80)) {
         jobs.delete(job.id);
@@ -957,6 +1158,23 @@ function pruneJobs() {
 }
 
 function createJobs(type, items, options = {}) {
+    if (recoveryBlocked) throw new Error(recoveryWarning);
+    const active = [...jobs.values()].filter(job => job.state === 'queued' || isJobActive(job));
+    const pathKey = value => {
+        const normalized = path.resolve(value);
+        return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+    };
+    for (const item of items) {
+        if (active.some(job => (item.paperId && job.paperId === item.paperId)
+            || (item.path && job.path && pathKey(item.path) === pathKey(job.path)))) {
+            throw new Error('DUPLICATE_ACTIVE_JOB: 同一论文或PDF已有本地任务，请等待完成，不重复提交。');
+        }
+        if (type === 'parse' && item.paperId && machineLibrary?.root === toolboxRoot
+            && machineLibrary.data.papers.some(paper => paper.paper_id === item.paperId
+                && ['running', 'timeout'].includes(paper.status))) {
+            throw new Error('PAPER_HAS_PENDING_TASK: 该论文已有未完成磁盘记录，请先续查状态，不重新上传。');
+        }
+    }
     pruneJobs();
     if (jobs.size + items.length > MAX_JOBS) {
         throw new Error(`任务数超过 ${MAX_JOBS} 个上限，请分批解析。`);
@@ -985,8 +1203,11 @@ function createJobs(type, items, options = {}) {
         jobs.set(job.id, job);
         internals.set(job.id, { options: { ...options }, dir: '', child: null, poll: null });
         created.push(job);
-        emitJob(job);
     }
+    // Persist the full batch before starting a child; avoid N full writes on import.
+    persistJobs();
+    for (const job of created) emitJob(job, { persist: false });
+    events.emit('jobs-changed', { reason: 'jobs-created' });
     pump();
     return created.map(serializeJob);
 }
@@ -1028,6 +1249,11 @@ function terminateChild(child) {
 function cancelJob(jobId) {
     const job = jobs.get(jobId);
     if (!job) throw new Error('任务不存在。');
+    if (job.state === 'interrupted' && !isJobActive(job)) {
+        internals.delete(job.id);
+        terminalJob(job, 'cancelled', { message: '已移除待恢复标记；未取消任何云端任务。' });
+        return serializeJob(job);
+    }
     if (!['queued', 'starting', 'running', 'polling'].includes(job.state)) return serializeJob(job);
     job.cancelRequested = true;
     const internal = internals.get(job.id);
@@ -1043,6 +1269,28 @@ function cancelJob(jobId) {
     return serializeJob(job);
 }
 
+function suspendAll() {
+    for (const job of jobs.values()) {
+        if (job.state !== 'queued' && !isJobActive(job)) continue;
+        const internal = internals.get(job.id);
+        if (internal) {
+            internal.suspended = true;
+            if (internal.poll) clearInterval(internal.poll);
+            internal.poll = null;
+            terminateChild(internal.child);
+        }
+        job.cancelRequested = true;
+        job.state = 'interrupted';
+        job.recovered = true;
+        job.finishedAt = null;
+        job.recoveryAction = job.paperId ? 'query' : 'review_import';
+        job.message = job.paperId
+            ? '已停止本地等待；下次请先续查云端状态，不会自动上传。'
+            : '导入已停放；下次请重新预检，不会自动上传。';
+        emitJob(job, { persist: false });
+    }
+    persistJobs();
+}
 function cancelAll() {
     for (const job of jobs.values()) {
         if (job.state !== 'queued' && !isJobActive(job)) continue;
@@ -1098,6 +1346,7 @@ function getStatus() {
         binary: binaryPath,
         baseDir: toolboxRoot ? path.join(toolboxRoot, 'file', 'mineru') : '',
         version,
+        jobRecovery: { file: recoveryFile, warning: recoveryWarning, blocked: recoveryBlocked },
         tokenConfigured: Boolean(String(pluginConfig.MINERU_TOKEN || '').trim()),
         modelVersion: pluginConfig.MODEL_VERSION || 'vlm',
         config: {
@@ -1114,12 +1363,18 @@ function getStatus() {
 }
 
 function saveConfig(patch = {}) {
+    if (Object.hasOwn(patch, 'toolboxRoot') && !patch.toolboxRoot
+        && config.toolboxRoot
+        && [...jobs.values()].some(job => job.state === 'queued' || isJobActive(job))) {
+        throw new Error('有任务正在运行或排队，不能清空 VCPToolBox 配置。');
+    }
     if (patch.toolboxRoot) {
         const candidate = path.resolve(String(patch.toolboxRoot));
         if (!fs.existsSync(path.join(candidate, 'Plugin', 'MinerUParser', 'plugin-manifest.json'))) {
             throw new Error('所选目录不含 Plugin/MinerUParser，请选择 VCPToolBox 根目录。');
         }
-        if (activeJobCount() > 0 && candidate !== path.resolve(toolboxRoot || '')) {
+        if ([...jobs.values()].some(job => job.state === 'queued' || isJobActive(job))
+            && candidate !== path.resolve(toolboxRoot || '')) {
             throw new Error('有任务正在运行或排队，切换 VCPToolBox 目录前请先等待完成或停止全部任务。');
         }
     }
@@ -1136,6 +1391,11 @@ function saveConfig(patch = {}) {
     config = { ...DEFAULT_CONFIG, ...next };
     invalidateLibrary();
     resolveEnvironment();
+    if (recoveryScope !== (toolboxRoot ? path.resolve(toolboxRoot) : '')) {
+        machineLibrary = null;
+        libraryRefreshSeq += 1;
+        loadJobRecoveryScope();
+    }
     return config;
 }
 
@@ -1156,6 +1416,7 @@ function initialize(options = {}) {
         config = { ...DEFAULT_CONFIG };
     }
     resolveEnvironment();
+    loadJobRecoveryScope();
     return getStatus();
 }
 
@@ -1169,11 +1430,15 @@ module.exports = {
     getStatus,
     saveConfig,
     scanLibrary,
+    refreshLibrary,
     getRecord,
     getPaperDetail,
+    fetchPaperDetail,
     readPdf,
     setPdfMapping,
     clearPdfMapping,
+    previewPdfMappingMigration,
+    applyPdfMappingMigration,
     resolveImagePath,
     resolveAssetDir,
     preflight,
@@ -1182,6 +1447,7 @@ module.exports = {
     continuePapers,
     cancelJob,
     cancelAll,
+    suspendAll,
     listJobs,
     on,
     _events: events,
@@ -1200,8 +1466,14 @@ module.exports = {
         },
         reinitialize(options = {}) {
             initialized = false;
+            recoveryScope = '';
+            recoveryFile = '';
+            recoveryWarning = '';
+            recoveryBlocked = false;
             config = { ...DEFAULT_CONFIG };
             libraryCache = { at: 0, records: [] };
+            machineLibrary = null;
+            libraryRefreshSeq += 1;
             pdfMapCache = { at: 0, map: {} };
             return initialize(options);
         },
