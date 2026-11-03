@@ -74,6 +74,8 @@ function createFixture(options = {}) {
     let unreadRefreshes = 0;
     const savedSettings = [];
     const sentRequests = [];
+    const configReads = [];
+    const notifications = [];
     const topicRequests = new Map();
     const createTopicRequests = new Map();
     const watcherRequests = new Map();
@@ -160,7 +162,10 @@ function createFixture(options = {}) {
             }
             return histories.get(`${itemId}:${requestedTopicId}`) || [];
         },
-        getAgentConfig: async itemId => configs[itemId],
+        getAgentConfig: async itemId => {
+            configReads.push(itemId);
+            return options.getAgentConfig ? options.getAgentConfig(itemId, configs) : configs[itemId];
+        },
         getAgentGroupConfig: async itemId => configs[itemId],
         createNewTopicForAgent: itemId => {
             const pending = deferred();
@@ -249,7 +254,7 @@ function createFixture(options = {}) {
         },
         electronAPI,
         flowlockManager: options.flowlockManager,
-        uiHelper: { showToastNotification() {}, autoResizeTextarea() {}, openModal() {} },
+        uiHelper: { showToastNotification(...args) { notifications.push(args); }, autoResizeTextarea() {}, openModal() {} },
         modules: {
             messageRenderer,
             streamManager: options.streamProjection || null,
@@ -297,6 +302,9 @@ function createFixture(options = {}) {
         sentRequests,
         attachmentRef,
         configs,
+        configReads,
+        notifications,
+        selectedItemRef: { get: () => selected, set: value => { selected = Object.freeze({ ...value }); } },
         // 设置页删掉当前助手时直接改这两个 ref，再调 displayNoItemSelected
         clearSelectionRefs() {
             selected = Object.freeze({ id: null, type: null, name: null, avatarUrl: null, config: null });
@@ -362,6 +370,111 @@ function createFixture(options = {}) {
         }),
     };
 }
+
+async function selectFixtureItem(fixture, itemId, itemType = 'agent', snapshot = fixture.configs[itemId]) {
+    const selecting = fixture.chatManager.selectItem(itemId, itemType, snapshot.name, null, snapshot);
+    await new Promise(resolve => setImmediate(resolve));
+    fixture.topicRequests.get(itemId).resolve(fixture.configs[itemId].topics);
+    await selecting;
+}
+
+test('real composer saves none and reselection replaces the stale list snapshot with full local config', async t => {
+    const fixture = createFixture();
+    let composer;
+    t.after(() => { composer?.dispose(); fixture.dom.window.close(); });
+    const staleSnapshot = { ...fixture.configs['agent-a'], model: 'old-model' };
+    fixture.configs['agent-a'] = { ...staleSnapshot };
+    await selectFixtureItem(fixture, 'agent-a', 'agent', staleSnapshot);
+    const { window } = fixture;
+    const actions = window.document.createElement('div');
+    actions.className = 'chat-input-actions';
+    window.document.body.append(actions);
+    window.eval(fs.readFileSync('modules/renderer/composerModelSelect.js', 'utf8'));
+    composer = window.ComposerModelSelect.init({
+        selectedItemRef: fixture.selectedItemRef,
+        electronAPI: {
+            getModelCapabilities: async () => ({ version: 1, reasoning: { efforts: ['none', 'high'] } }),
+            saveAgentConfig: async (id, patch) => {
+                fixture.configs[id] = { ...fixture.configs[id], ...JSON.parse(JSON.stringify(patch)) };
+                return { success: true };
+            },
+        },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const select = window.document.querySelector('.vcp-thinking-select');
+    select.value = 'none';
+    select.dispatchEvent(new window.Event('change'));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(fixture.configs['agent-a'].reasoningSelection.value, 'none');
+    assert.equal(staleSnapshot.reasoningSelection, undefined, 'list closure still holds the old snapshot');
+    fixture.configs['agent-a'] = { ...fixture.configs['agent-a'], model: 'latest-model', systemPrompt: 'latest prompt', temperature: 0.2 };
+    await selectFixtureItem(fixture, 'agent-b');
+    composer.refresh();
+    await selectFixtureItem(fixture, 'agent-a', 'agent', staleSnapshot);
+    composer.refresh();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(select.value, 'none');
+    assert.deepEqual(fixture.state().selected.config, fixture.configs['agent-a']);
+    assert.equal(window.document.querySelector('.vcp-model-select-label').textContent, 'latest-model');
+    // Each selection reads before publication; the existing timestamp bubble also reads config.
+    assert.deepEqual(fixture.configReads, ['agent-a', 'agent-a', 'agent-b', 'agent-b', 'agent-a', 'agent-a']);
+    assert.equal(fixture.sentRequests.length, 0);
+});
+
+for (const outcome of ['success', 'reject']) {
+    test(`a late local config ${outcome} cannot publish over a newer selection`, async t => {
+        const gate = deferred();
+        const fixture = createFixture({ getAgentConfig: (id, configs) => id === 'agent-a' ? gate.promise : configs[id] });
+        t.after(() => fixture.dom.window.close());
+        const selecting = fixture.chatManager.selectItem('agent-a', 'agent', 'Agent A', null, fixture.configs['agent-a']);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(fixture.configReads, ['agent-a']);
+        assert.equal(fixture.state().selected.id, null);
+        assert.equal(fixture.publishedSelections.length, 0);
+        await selectFixtureItem(fixture, 'agent-b');
+        const publications = fixture.publishedSelections.length;
+        if (outcome === 'reject') gate.reject(new Error('late read failure'));
+        else gate.resolve({ ...fixture.configs['agent-a'], reasoningSelection: { version: 1, mode: 'effort', value: 'none' } });
+        await selecting;
+        assert.equal(fixture.state().selected.id, 'agent-b');
+        assert.equal(fixture.state().topicId, 'topic-b');
+        assert.equal(fixture.publishedSelections.length, publications);
+        assert.equal(fixture.topicRequests.has('agent-a'), false);
+        assert.deepEqual(fixture.notifications, []);
+    });
+}
+
+for (const failure of ['reject', 'error', 'null', 'unsuccessful']) {
+    test(`local config ${failure} cancels selection, notifies and releases its pending marker`, async t => {
+        const fixture = createFixture({ getAgentConfig: async () => {
+            if (failure === 'reject') throw new Error('local read failure');
+            if (failure === 'error') return { error: 'local read failure' };
+            if (failure === 'unsuccessful') return { success: false };
+            return null;
+        } });
+        t.after(() => fixture.dom.window.close());
+        await fixture.chatManager.selectItem('agent-a', 'agent', 'Agent A', null, fixture.configs['agent-a']);
+        assert.equal(fixture.state().selected.id, null);
+        assert.equal(fixture.publishedSelections.length, 0);
+        assert.equal(fixture.topicRequests.size, 0);
+        assert.equal(fixture.notifications.length, 1);
+        assert.match(fixture.notifications[0][0], /加载助手配置失败/);
+        assert.equal(fixture.notifications[0][1], 'error');
+        assert.equal(fixture.chatManager.displayNoItemSelected(), true, 'finishSelection released the pending marker');
+        await selectFixtureItem(fixture, 'group-jev', 'group');
+        assert.equal(fixture.state().selected.id, 'group-jev');
+    });
+}
+
+test('group selection uses its supplied config without an agent config query', async t => {
+    const fixture = createFixture({ getAgentConfig: () => { throw new Error('group must not read agent config'); } });
+    t.after(() => fixture.dom.window.close());
+    await selectFixtureItem(fixture, 'group-jev', 'group');
+    assert.deepEqual(fixture.configReads, []);
+    assert.equal(fixture.state().selected.config, fixture.configs['group-jev']);
+    assert.equal(fixture.state().topicId, 'topic-jev');
+    assert.deepEqual(fixture.notifications, []);
+});
 
 test('ChatManager publishes readiness only after synchronous listener setup completes', () => {
     const fixture = createFixture({ failCanvasRegistration: true });

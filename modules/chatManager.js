@@ -796,6 +796,24 @@ export const chatManager = (() => {
 
         if (!isSelectionCurrent()) return;
 
+        // List click handlers may retain an older snapshot than the locally saved config.
+        if (itemType === 'agent') {
+            try {
+                const latestConfig = await electronAPI.getAgentConfig(itemId);
+                if (!isSelectionCurrent()) return;
+                if (!latestConfig || latestConfig.error || latestConfig.success === false) {
+                    throw new Error(latestConfig?.error || '无法读取助手配置');
+                }
+                itemFullConfig = latestConfig;
+            } catch (error) {
+                if (!isSelectionCurrent()) return;
+                finishSelection();
+                console.error(`[ChatManager] Failed to get agent config for ${itemId}:`, error);
+                uiHelper?.showToastNotification?.(`加载助手配置失败，已取消切换：${error.message}`, 'error');
+                return;
+            }
+        }
+
         const { currentChatNameH3, currentItemActionBtn, messageInput, sendMessageBtn, attachFileBtn } = elements;
         let currentSelectedItem = currentSelectedItemRef.get();
 

@@ -1528,6 +1528,12 @@ if (!gotTheLock) {
         });
 
         // IPC handler to provide cached models to the renderer process
+        const { createModelCapabilitiesClient } = require('./modules/services/modelCapabilitiesClient');
+        const getModelCapabilities = createModelCapabilitiesClient({
+            readSettings: () => appSettingsManager.readSettings()
+        });
+        ipcMain.handle('get-model-capabilities', (_event, model) => getModelCapabilities(model));
+
         ipcMain.handle('get-cached-models', () => {
             return cachedModels;
         });

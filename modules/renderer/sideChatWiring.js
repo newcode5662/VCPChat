@@ -496,6 +496,7 @@ export function createSideChatWiring({
                 return rawConfig ? structuredClone(rawConfig) : null;
             },
             listModels: () => listSideChatModels(win.electronAPI || chatAPI),
+            getModelCapabilities: model => (win.electronAPI || chatAPI)?.getModelCapabilities?.(model),
             refreshParentSnapshot: (descriptor) => {
                 // 分形分支：快照是分叉那一刻固化的「祖先链完整上下文」。
                 // 不能在发送前重读主聊天当前历史，否则会覆盖掉祖先链、让孙分支丢根上下文。

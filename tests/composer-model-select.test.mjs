@@ -12,6 +12,47 @@ const sourceCode = fs.readFileSync(path.resolve(__dirname, '../modules/renderer/
 
 const tick = () => new Promise(resolve => setTimeout(resolve, 15));
 
+for (const unavailable of [false, true]) {
+    test(`Composer manual reasoning preserves default (metadata unavailable: ${unavailable})`, async t => {
+        const { dom, window, document } = setupTestEnv();
+        const efforts = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
+        let item = { type: 'agent', id: 'manual-agent', config: { model: 'm' } };
+        const saves = [];
+        const instance = window.ComposerModelSelect.init({
+            electronAPI: {
+                getModelCapabilities: async () => ({ version: 1, model: 'm', reasoning: {
+                    status: 'unknown', source: 'manual', manual: true, unavailable, efforts
+                } }),
+                saveAgentConfig: async (id, config) => { saves.push({ id, config }); return { success: true }; }
+            },
+            selectedItemRef: { get: () => item, set: value => { item = value; } },
+            sendMessageBtn: document.getElementById('sendMessageBtn')
+        });
+        t.after(() => { instance.dispose(); dom.window.close(); });
+        await tick();
+        const select = document.querySelector('.vcp-thinking-select');
+        assert.deepEqual([...select.options].map(o => o.value), ['default', ...efforts]);
+        assert.equal(select.value, 'default');
+        assert.equal(saves.length, 0);
+        assert.match(select.title, /上游未声明能力；手动发送 reasoning_effort，是否支持由上游决定/);
+        assert.match(select.title, /默认不覆盖/);
+        for (const option of [...select.options].slice(1)) {
+            assert.match(option.textContent, /手动/);
+            assert.equal(option.disabled, false);
+        }
+        for (const value of ['max', 'none', 'default']) {
+            select.value = value;
+            select.dispatchEvent(new window.Event('change'));
+            await tick();
+            assert.deepEqual(JSON.parse(JSON.stringify(item.config.reasoningSelection)),
+                value === 'default' ? { version: 1, mode: 'default' } : { version: 1, mode: 'effort', value });
+        }
+        assert.equal(saves.length, 3);
+        assert.ok(saves.every(save => save.id === 'manual-agent'));
+    });
+}
+
+
 function setupTestEnv() {
     const dom = new JSDOM(`<!doctype html>
 <html>
@@ -336,4 +377,47 @@ test('ComposerModelSelect: dispose之后保存完成不得回写选中项和设�
     await h.flush();
     assert.equal(h.current.config.model, 'model-a');
     assert.equal(h.document.getElementById('agentModel').value, '');
+});
+
+test('thinking control uses backend efforts and saves semantic selection left of model', async t => {
+    const { dom, window, document } = setupTestEnv();
+    let current = { type: 'agent', id: 'a', config: { model: 'm' } };
+    const writes = [];
+    const instance = window.ComposerModelSelect.init({
+        electronAPI: {
+            getModelCapabilities: async model => ({ version: 1, model,
+                reasoning: { status: 'supported', efforts: ['high', 'low'], supportsBudget: false } }),
+            saveAgentConfig: async (id, patch) => { writes.push({ id, patch }); return { success: true }; }
+        },
+        selectedItemRef: { get: () => current, set: value => { current = value; } }
+    });
+    t.after(() => { instance.dispose(); dom.window.close(); });
+    await tick();
+    const select = document.querySelector('.vcp-thinking-select');
+    assert.deepEqual([...select.options].map(option => option.value), ['default', 'high', 'low']);
+    assert.equal(select.parentElement.lastElementChild.tagName, 'BUTTON');
+    select.value = 'high';
+    select.dispatchEvent(new window.Event('change'));
+    await tick();
+    assert.equal(writes[0].patch.reasoningSelection.mode, 'effort');
+    assert.equal(current.config.reasoningSelection.value, 'high');
+    assert.equal(current.config.reasoning_effort, undefined);
+});
+
+test('thinking capability response for old Agent cannot overwrite current options', async t => {
+    const { dom, window, document } = setupTestEnv();
+    let current = { type: 'agent', id: 'a', config: { model: 'old' } };
+    const pending = [];
+    const instance = window.ComposerModelSelect.init({
+        electronAPI: { getModelCapabilities: model => new Promise(resolve => pending.push({ model, resolve })) },
+        selectedItemRef: { get: () => current, set: value => { current = value; } }
+    });
+    t.after(() => { instance.dispose(); dom.window.close(); });
+    current = { type: 'agent', id: 'b', config: { model: 'new' } };
+    instance.refresh();
+    pending[1].resolve({ version: 1, model: 'new', reasoning: { efforts: ['low'] } });
+    await tick();
+    pending[0].resolve({ version: 1, model: 'old', reasoning: { efforts: ['high'] } });
+    await tick();
+    assert.deepEqual([...document.querySelector('.vcp-thinking-select').options].map(option => option.value), ['default', 'low']);
 });

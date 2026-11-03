@@ -338,3 +338,13 @@ test('parallel window requests resolve their own agent and carry the same worksp
     assert.equal(requests[0].messages[0].content, 'TREE_a\n\nRULE_a');
     assert.equal(requests[1].messages[0].content, 'TREE_b\n\nRULE_b');
 });
+
+test('reasoning semantic preference is frozen per prepared model config', async () => {
+    const { buildModelConfig } = await loadOrchestratorModule();
+    const config = { model: 'm', reasoningSelection: { version: 1, mode: 'effort', value: 'high' } };
+    const result = buildModelConfig(config);
+    config.reasoningSelection.value = 'low';
+    assert.equal(result.reasoningSelection.value, 'high');
+    assert.equal(result.reasoning_effort, undefined);
+    assert.equal(buildModelConfig({ model: 'm' }).reasoningSelection, undefined);
+});

@@ -15,7 +15,14 @@ function composerInput(value) {
         references: (Array.isArray(value?.references) ? value.references : [])
             .filter(ref => ref && typeof ref.id === 'string' && typeof ref.text === 'string')
             .map(({ id, text, sourceMessageId }) => ({ id, text, sourceMessageId: typeof sourceMessageId === 'string' ? sourceMessageId : null })),
-        model: typeof value?.model === 'string' ? value.model : null
+        model: typeof value?.model === 'string' ? value.model : null,
+        ...(value?.reasoningSelection?.version === 1 ? {
+            reasoningSelection: {
+                version: 1,
+                mode: value.reasoningSelection.mode,
+                ...(value.reasoningSelection.mode !== 'default' ? { value: value.reasoningSelection.value } : {})
+            }
+        } : {})
     };
 }
 

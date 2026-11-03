@@ -49,7 +49,125 @@
         chevron.setAttribute('aria-hidden', 'true');
         chevron.textContent = 'chevron-down';
         trigger.append(labelEl, chevron);
-        wrap.appendChild(trigger);
+        const thinkingSelect = document.createElement('select');
+        thinkingSelect.className = 'vcp-thinking-select';
+        thinkingSelect.style.cssText = 'background:transparent;color:inherit;border:0;font:inherit;font-size:13px;max-width:170px';
+        thinkingSelect.setAttribute('aria-label', '思考强度');
+        thinkingSelect.title = '思考：默认（上游未声明可用配置）';
+        thinkingSelect.add(new Option('思考：默认', 'default'));
+        const budgetInput = document.createElement('input');
+        budgetInput.type = 'number';
+        budgetInput.min = '1';
+        budgetInput.step = '1';
+        budgetInput.placeholder = '思考 token';
+        budgetInput.setAttribute('aria-label', '思考 token 预算，按 Enter 保存');
+        budgetInput.style.cssText = 'width:100px;background:transparent;color:inherit;border:1px solid var(--border-color);border-radius:6px';
+        budgetInput.hidden = true;
+        wrap.append(thinkingSelect, budgetInput, trigger);
+        let capabilitySeq = 0;
+        let capabilityIdentity = '';
+        let capability = null;
+        let capabilityError = null;
+        let thinkingSaving = false;
+
+        function renderThinking(item) {
+            const selection = item?.config?.reasoningSelection || item?.reasoningSelection;
+            thinkingSelect.replaceChildren(new Option('思考：默认', 'default'));
+            const labels = { none: '关闭', minimal: '极低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最大' };
+            for (const effort of capability?.efforts || []) {
+                if (typeof effort === 'string') thinkingSelect.add(new Option(`思考：${labels[effort] || effort}${capability.manual ? '（手动）' : ''}`, effort));
+            }
+            if (capability?.supportsBudget) thinkingSelect.add(new Option('思考：自定义预算', 'budget'));
+            const value = selection?.mode === 'effort' ? selection.value : selection?.mode === 'budget' ? 'budget' : 'default';
+            const valid = [...thinkingSelect.options].some(option => option.value === value);
+            if (!valid && value !== 'default') {
+                const unavailable = new Option(`思考：${value}（当前不可用）`, value);
+                unavailable.disabled = true;
+                thinkingSelect.add(unavailable);
+            }
+            thinkingSelect.value = value;
+            thinkingSelect.disabled = thinkingSaving;
+            const errors = {
+                CAPABILITY_ENDPOINT_MISSING: '后端能力接口不存在（404）：请确认后端运行版本与目录',
+                CAPABILITY_AUTH_FAILED: '能力查询认证失败：请检查服务器凭据',
+                CAPABILITY_TIMEOUT: '能力查询超时',
+                CAPABILITY_NETWORK_ERROR: '无法连接能力接口',
+                CAPABILITY_HTTP_ERROR: '能力接口返回错误',
+                CAPABILITY_INVALID_RESPONSE: '能力接口响应格式不兼容',
+                CAPABILITY_UNAVAILABLE: '能力查询不可用：请确认客户端与后端已加载新版本'
+            };
+            thinkingSelect.title = capabilityError ? (errors[capabilityError] || '能力查询失败')
+                : capability?.manual ? `${capability.unavailable ? '后端无法获取上游模型目录；' : ''}上游未声明能力；手动发送 reasoning_effort，是否支持由上游决定；默认不覆盖上游策略`
+                    : capability?.unavailable ? '后端无法获取上游模型目录'
+                    : capability?.status === 'supported'
+                        ? '按后端声明选择思考配置；默认不覆盖上游策略'
+                        : '上游未声明可用配置；默认沿用现有策略';
+            if (capabilityError) thinkingSelect.options[0].textContent = '思考：接口不可用';
+            budgetInput.hidden = value !== 'budget';
+            if (selection?.mode === 'budget') budgetInput.value = String(selection.value);
+        }
+
+        async function refreshThinking(item) {
+            const identity = `${item.id}:${readModel(item)}`;
+            if (identity === capabilityIdentity) { renderThinking(item); return; }
+            capabilityIdentity = identity;
+            capability = null;
+            capabilityError = null;
+            renderThinking(item);
+            const seq = ++capabilitySeq;
+            try {
+                const result = await electronAPI.getModelCapabilities?.(readModel(item));
+                if (disposed || seq !== capabilitySeq || `${currentItem()?.id}:${readModel(currentItem())}` !== identity) return;
+                capability = result?.version === 1 ? result.reasoning : null;
+                capabilityError = result?.error || (!capability ? 'CAPABILITY_UNAVAILABLE' : null);
+                renderThinking(currentItem());
+            } catch {
+                if (!disposed && seq === capabilitySeq) {
+                    capabilityError = 'CAPABILITY_NETWORK_ERROR';
+                    renderThinking(currentItem());
+                }
+            }
+        }
+
+        async function saveThinking() {
+            const item = currentItem();
+            if (disposed || !isAgent(item) || thinkingSaving || saves.has(item.id)) return;
+            const value = thinkingSelect.value;
+            if (value === 'budget' && (!Number.isSafeInteger(Number(budgetInput.value)) || Number(budgetInput.value) <= 0)) {
+                budgetInput.hidden = false;
+                budgetInput.focus();
+                return;
+            }
+            const selection = { version: 1, mode: value === 'default' ? 'default' : value === 'budget' ? 'budget' : 'effort',
+                ...(value === 'default' ? {} : { value: value === 'budget' ? Number(budgetInput.value) : value }) };
+            const model = readModel(item);
+            thinkingSaving = true;
+            thinkingSelect.disabled = true;
+            trigger.disabled = true;
+            try {
+                const result = await electronAPI.saveAgentConfig(item.id, { reasoningSelection: selection });
+                if (!result?.success) throw new Error(result?.error || '保存失败');
+                const latest = currentItem();
+                if (!disposed && latest?.id === item.id && readModel(latest) === model) {
+                    selectedItemRef.set({ ...latest, reasoningSelection: selection,
+                        ...(latest.config ? { config: { ...latest.config, reasoningSelection: selection } } : {}) });
+                }
+            } catch (error) {
+                window.uiHelperFunctions?.showToastNotification?.(`思考配置保存失败：${error.message}`, 'error');
+            } finally {
+                thinkingSaving = false;
+                trigger.disabled = false;
+                if (!disposed) renderThinking(currentItem());
+            }
+        }
+        thinkingSelect.addEventListener('change', () => {
+            budgetInput.hidden = thinkingSelect.value !== 'budget';
+            if (thinkingSelect.value === 'budget') budgetInput.focus();
+            else void saveThinking();
+        });
+        budgetInput.addEventListener('keydown', event => {
+            if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); void saveThinking(); }
+        });
 
         const anchor = document.getElementById('mainVoiceInputBtn')
             || sendMessageBtn
@@ -68,7 +186,8 @@
             const item = currentItem();
             const show = isAgent(item);
             wrap.hidden = !show;
-            if (!show) { popup?.close?.(); return; }
+            if (!show) { capabilitySeq++; capabilityIdentity = ''; popup?.close?.(); return; }
+            void refreshThinking(item);
             const model = readModel(item);
             labelEl.textContent = model || '选择模型';
             trigger.title = model
@@ -111,7 +230,7 @@
 
         function choose(modelId) {
             const item = currentItem();
-            if (disposed || !isAgent(item)) return;
+            if (disposed || !isAgent(item) || thinkingSaving) return;
             const existing = saves.get(item.id);
             if (existing) {
                 // 保存中的再次选择不能丢弃，包括切回尚未被替换的原模型。
@@ -181,7 +300,8 @@
             observer = new MutationObserver(() => { refresh(); setTimeout(refresh, 200); });
             observer.observe(nameObserveTarget, { childList: true, characterData: true, subtree: true });
         }
-        window.addEventListener('focus', refresh);
+        const onFocus = () => { capabilityIdentity = ''; refresh(); };
+        window.addEventListener('focus', onFocus);
         refresh();
 
         return {
@@ -189,10 +309,11 @@
             dispose() {
                 if (disposed) return;
                 disposed = true;
+                capabilitySeq++;
                 for (const state of saves.values()) state.pending = null;
                 popup?.dispose();
                 popup = null;
-                window.removeEventListener('focus', refresh);
+                window.removeEventListener('focus', onFocus);
                 observer?.disconnect();
                 wrap.remove();
                 document.getElementById(STYLE_ID)?.remove();

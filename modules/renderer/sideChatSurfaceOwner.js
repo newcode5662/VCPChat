@@ -81,6 +81,7 @@ export async function mountSideChatSurface(container, {
     const clonedConfig = agentConfig ? structuredClone(agentConfig) : {};
     let currentModel = descriptor.model || clonedConfig?.model || '';
     clonedConfig.model = currentModel;
+    if (descriptor.reasoningSelection) clonedConfig.reasoningSelection = structuredClone(descriptor.reasoningSelection);
 
     const selectedItem = {
         id: descriptor.child.itemId,
@@ -288,6 +289,11 @@ export async function mountSideChatSurface(container, {
         modelPickerBtn,
         modelPopover,
         persistMetadata: () => persistenceOwner.saveComposerInput(),
+        getReasoningSelection: () => selectedItem.config?.reasoningSelection,
+        onReasoningChange: selection => {
+            selectedItem.config.reasoningSelection = selection;
+            store.currentDescriptor = { ...store.currentDescriptor, reasoningSelection: selection };
+        },
         onModelChange: model => {
             selectedItem.model = model;
             if (selectedItem.config) selectedItem.config.model = model;

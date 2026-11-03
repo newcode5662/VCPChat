@@ -1313,7 +1313,13 @@ function initialize(mainWindow, context) {
             console.log('模型配置:', modelConfig);
             if (context) console.log('上下文:', context);
 
-            const vcpchatExtensions = buildVcpChatExtensionsFromMessages(messages, context, messageId);
+            let vcpchatExtensions = buildVcpChatExtensionsFromMessages(messages, context, messageId);
+            const reasoningSelection = modelConfig.reasoningSelection;
+            if (reasoningSelection) {
+                vcpchatExtensions = { ...vcpchatExtensions, reasoning: structuredClone(reasoningSelection) };
+            }
+            modelConfig = { ...modelConfig };
+            delete modelConfig.reasoningSelection;
             messages = stripInternalMessageMetadata(messages);
 
             // 🔧 在发送前验证请求体

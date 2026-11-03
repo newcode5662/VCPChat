@@ -245,6 +245,8 @@ function buildModelConfig(agentConfig = {}, overrides = {}) {
             ? { top_k: Number.parseInt(agentConfig.top_k, 10) }
             : {}),
         stream,
+        ...(agentConfig.reasoningSelection
+            ? { reasoningSelection: structuredClone(agentConfig.reasoningSelection) } : {}),
         ...overrides,
     };
 }

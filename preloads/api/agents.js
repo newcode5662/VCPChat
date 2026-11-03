@@ -31,6 +31,7 @@ module.exports = {
 
         // 模型列表
         getCachedModels: invoke('get-cached-models'),
+        getModelCapabilities: invoke('get-model-capabilities', 'model'),
         refreshModels: invoke('refresh-models'),
         getHotModels: invoke('get-hot-models'),
         getFavoriteModels: invoke('get-favorite-models'),
