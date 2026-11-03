@@ -62,6 +62,9 @@ const { registerChartEmbedScheme, installChartEmbedProtocol } = require('./modul
 registerChartEmbedScheme(protocol);
 const minerUHandlers = require('./modules/ipc/minerUHandlers'); // MinerU 论文工作台
 minerUHandlers.registerScheme(protocol);
+// 文坊中原位打开的网页（scriptorium-page:// 协议），须在 app ready 之前登记。
+const scriptoriumPages = require('./modules/scriptorium/webPages');
+protocol.registerSchemesAsPrivileged([scriptoriumPages.PRIVILEGE]);
 
 // 不再对整个应用关闭 Chromium 的后台节流（background-timer-throttling / renderer-backgrounding /
 // backgrounding-occluded-windows）和挂起监视器：那组开关让所有窗口、所有 <webview> 和 GPU 进程在后台
@@ -1795,7 +1798,7 @@ if (!gotTheLock) {
         });
 
         sovitsHandlers.initialize(mainWindow, appSettingsManager); // Initialize SovitsTTS handlers
-        musicHandlers.initialize({ mainWindow, openChildWindows, APP_DATA_ROOT_IN_PROJECT, startAudioEngine, stopAudioEngine });
+        musicHandlers.initialize({ mainWindow, openChildWindows, APP_DATA_ROOT_IN_PROJECT, startAudioEngine, stopAudioEngine, settingsManager: appSettingsManager });
         diceHandlers.initialize({ projectRoot: PROJECT_ROOT });
         themeHandlers.initialize({ mainWindow, openChildWindows, projectRoot: PROJECT_ROOT, APP_DATA_ROOT_IN_PROJECT, settingsManager: appSettingsManager });
         emoticonHandlers.initialize({ SETTINGS_FILE, APP_DATA_ROOT_IN_PROJECT });
@@ -1808,6 +1811,7 @@ if (!gotTheLock) {
             protocol,
             net: require('electron').net,
         });
+        scriptoriumPages.installProtocol();
         chartService = await chartHandlers.initialize({
             projectRoot: PROJECT_ROOT,
             appDataRoot: APP_DATA_ROOT_IN_PROJECT,
@@ -1972,6 +1976,20 @@ if (!gotTheLock) {
         desktopRemoteHandlers.initialize({ mainWindow });
         reportLauncherProgress('workspace-ready', 0.76, '工作空间与功能模块已连接');
         promptHandlers.initialize({ AGENT_DIR, APP_DATA_ROOT_IN_PROJECT });
+        require('./modules/services/conversationContext').initialize({
+            load: owner => owner.type === 'agent'
+                ? agentConfigManager.readAgentConfig(owner.id)
+                : groupChat.getAgentGroupConfig(owner.id),
+            update: (owner, mutate) => owner.type === 'agent'
+                ? agentConfigManager.updateAgentConfig(owner.id, mutate)
+                : groupChat.mutateGroupConfig(owner.id, mutate),
+            workspace: () => ({
+                workspaces: workspaceHandlers.workspaceService.list(),
+                activeWorkspaceId: workspaceHandlers.getActiveWorkspaceId(),
+                promptSettings: workspaceHandlers.getPromptSettings(),
+            }),
+            rules: () => tavernHandlers.readStore(),
+        });
         tavernHandlers.initialize({ APP_DATA_ROOT_IN_PROJECT });
         voiceHandlers.initialize({ mainWindow, openChildWindows, settingsManager: appSettingsManager, projectRoot: PROJECT_ROOT });
         localSttHandlers.initialize({ appDataRoot: APP_DATA_ROOT_IN_PROJECT });

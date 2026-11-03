@@ -285,7 +285,9 @@ function hydrateWorkspacePanel(doc, refs) {
     async function refresh() {
         try {
             const result = await api.listWorkspaces();
-            if (result?.success) render(result.workspaces || []);
+            if (result?.success) {
+                render(result.workspaces || []);
+            }
         } catch (error) {
             setStatus(`读取工作区失败：${error.message}`, true);
         }

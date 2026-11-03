@@ -19,6 +19,7 @@ const { TicketStore, parsePickSpec } = require('./tickets');
 const { IndexerClient } = require('./indexerClient');
 const SR = require('./symbolResolver');
 const LG = require('./linkGraph');
+const ES = require('./evalSymbol');
 const { isPathInside, toPosixRelative } = require('../../shared/fileKit/paths');
 const A = require('./args');
 const T = require('../../shared/fileKit/text');
@@ -146,6 +147,7 @@ async function stopIndexer() {
 }
 
 async function cleanup() {
+    await ES.cleanup();
     closeStore();
     await stopIndexer();
 }
@@ -365,15 +367,21 @@ function recordExternalDrift(project, rel, disk) {
 }
 
 async function reviewCode(abs, before, after) {
-    if (!isValidatable(abs)) return { supported: false, introduced: [], existing: 0 };
+    if (!isValidatable(abs)) return { supported: false, introduced: [], existing: 0, existingItems: [] };
     const [b, a] = await Promise.all([validateCode(abs, before), validateCode(abs, after)]);
-    return { supported: true, introduced: diffDiagnostics(b, a), existing: b.length };
+    // existing 保持数字（details 消费方兼容）；existingItems 供回执列出明细
+    return { supported: true, introduced: diffDiagnostics(b, a), existing: b.length, existingItems: b.slice(0, 10) };
 }
 
 function renderReview(review) {
     if (!review.supported) return '';
     if (!review.introduced.length) {
-        return `### 代码审查\n- ✅ 未引入新问题${review.existing ? `（存量 ${review.existing} 项未计入）` : ''}`;
+        if (!review.existing) return '### 代码审查\n- ✅ 未引入新问题';
+        const shown = (review.existingItems || []).slice(0, 3);
+        const detail = shown.length
+            ? `：\n${formatDiagnostics(shown, '').split('\n').map(l => `  ${l}`).join('\n')}${review.existing > shown.length ? `\n  - …另有 ${review.existing - shown.length} 项` : ''}`
+            : '';
+        return `### 代码审查\n- ✅ 未引入新问题（存量 ${review.existing} 项未计入）${detail}`;
     }
     return `### 代码审查（本次新增 ${review.introduced.length} 项）\n${formatDiagnostics(review.introduced, '')}`;
 }
@@ -628,8 +636,34 @@ function collectReadTargets(ctx, args) {
     return targets.filter(t => !seen.has(keyOf(t)) && seen.add(keyOf(t)));
 }
 
+// find 支持 a|b 多片段：按未转义的单个 | 拆分，各片段仍按 target 规则（字面量、忽略行首尾空白）匹配后取并集。
+// || 视为字面量（JS/TS 逻辑或很常见），\| 表示字面竖线；多行查询（含首尾锚定）不拆分。
+function splitFindQuery(raw) {
+    const text = String(raw);
+    if (text.includes('\n') || !text.includes('|')) return [text];
+    const parts = [];
+    let cur = '';
+    for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '\\' && text[i + 1] === '|') { cur += '|'; i++; continue; }
+        if (ch === '|') {
+            if (text[i + 1] === '|') { cur += '||'; i++; continue; }
+            parts.push(cur);
+            cur = '';
+            continue;
+        }
+        cur += ch;
+    }
+    parts.push(cur);
+    if (parts.length === 1) return [cur];
+    const frags = [...new Set(parts.map(p => p.trim()).filter(Boolean))];
+    return frags.length ? frags : [text];
+}
+
 async function findInFiles(ctx, targets, needle) {
-    const query = T.normalizeEol(needle);
+    const fragments = splitFindQuery(T.normalizeEol(needle));
+    const multi = fragments.length > 1;
+    const fragCounts = new Map(fragments.map(f => [f, 0]));
     const out = [];
     let total = 0;
     for (const t of targets) {
@@ -638,8 +672,17 @@ async function findInFiles(ctx, targets, needle) {
         let meta;
         try { meta = decodeText(disk.buffer, t.rel); } catch (_e) { continue; }
         const idx = engine.buildIndex(meta.text);
-        let hits;
-        try { hits = engine.locateTarget(idx, query).hits; } catch (_e) { hits = []; } // 首尾锚定未命中视为 0 处
+        const seen = new Map();
+        for (const q of fragments) {
+            let found;
+            try { found = engine.locateTarget(idx, q).hits; } catch (_e) { found = []; } // 首尾锚定未命中视为 0 处
+            fragCounts.set(q, fragCounts.get(q) + found.length);
+            for (const h of found) {
+                const k = `${h.startLine}-${h.endLine}`;
+                if (!seen.has(k)) seen.set(k, h);
+            }
+        }
+        const hits = [...seen.values()].sort((a, b) => a.startLine - b.startLine || a.endLine - b.endLine);
         total += hits.length;
         const outline = hits.length && out.length < 30 ? await outlineOf(t.rel, meta.text) : null;
         for (const h of hits.slice(0, Math.max(0, 30 - out.length))) {
@@ -647,8 +690,15 @@ async function findInFiles(ctx, targets, needle) {
             out.push(`#### \`${t.rel}\` · L${h.startLine}-${h.endLine}${scope ? ` · in ${scope}` : ''}\n${T.markdownFence(engine.contextBlock(idx, h.startLine, h.endLine), T.languageOf(t.rel))}`);
         }
     }
-    const head = `## Find “${String(needle).split('\n')[0].slice(0, 60)}” · 共 ${total} 处${total > 30 ? '（仅显示前 30 处）' : ''}\n${projectHeader(ctx.project, ctx.rootInfo)}`;
-    return textResult(`${head}\n\n${out.join('\n\n') || '- 未找到。'}`, { command: 'ReadCode', mode: 'find', total });
+    const fragSummary = fragments.map(f => `\`${f.slice(0, 30)}\`（${fragCounts.get(f)}）`).join(' / ');
+    const modeLine = multi
+        ? `- 匹配方式：按 \`|\` 拆为 ${fragments.length} 个片段，各片段按字面量匹配（同 EditCode target 规则）后取并集：${fragSummary}。要匹配字面竖线请写 \`\\|\`，\`||\` 始终按字面量处理。`
+        : '';
+    const empty = multi
+        ? `- 未找到：${fragments.length} 个片段均未命中。`
+        : `- 未找到（按字面量匹配，同 EditCode target 规则，忽略行首尾空白；${targets.length} 个文件）。多个关键词可写成 \`a|b\`。`;
+    const head = `## Find “${String(needle).split('\n')[0].slice(0, 60)}” · 共 ${total} 处${total > 30 ? '（仅显示前 30 处）' : ''}\n${projectHeader(ctx.project, ctx.rootInfo)}${modeLine ? `\n${modeLine}` : ''}`;
+    return textResult(`${head}\n\n${out.join('\n\n') || empty}`, { command: 'ReadCode', mode: 'find', total, fragments: multi ? Object.fromEntries(fragCounts) : undefined });
 }
 
 async function readCode(args) {
@@ -1809,7 +1859,41 @@ async function getNodeDiff(args) {
 
 // ============================ 分发 ============================
 
+async function evalSymbolCmd(args) {
+    const ctx = projectOf(args, { write: true });
+    const parsed = SR.splitPathSymbol(A.str(args, 'path'));
+    const ref = parsed.symbol || A.str(args, 'symbol');
+    if (!ref) throw new Error('EvalSymbol requires path=file#symbol');
+    const file = fileOf(ctx, parsed.path, { write: true });
+    const [realRoot, realFile] = await Promise.all([
+        fsp.realpath(ctx.rootInfo.root), fsp.realpath(file.abs),
+    ]);
+    if (!isPathInside(realFile, realRoot)) throw new Error('EvalSymbol target resolves outside project root');
+    const resolved = await resolveSymbolInFile(file, ref, {
+        pick: A.pick(args, 'pick'), line: A.pick(args, 'line'),
+    });
+    if (resolved.res.status !== 'ok') {
+        return textResult(renderSymbolMiss(file, resolved.res, 'EvalSymbol'), {
+            command: 'EvalSymbol', status: resolved.res.status,
+            candidates: resolved.res.candidates, suggestions: resolved.res.suggestions,
+        });
+    }
+    if (resolved.outline.hasError) return textResult('EvalSymbol: source contains syntax errors; execution rejected', {
+        command: 'EvalSymbol', status: 'syntax_error',
+    });
+    const result = await ES.evaluate({
+        root: ctx.rootInfo.root, file: realFile,
+        symbol: resolved.res.symbol.qualified,
+        sourceHash: resolved.disk.hash, args,
+    });
+    return textResult(ES.render(result, file.rel), {
+        command: 'EvalSymbol', projectId: ctx.project.id, path: file.rel,
+        valueEncoding: 'typed-v1', ...result,
+    });
+}
+
 const COMMANDS = {
+    evalsymbol: evalSymbolCmd,
     listworkspaces: listWorkspaces,
     createproject: createProject,
     listprojects: listProjects,
@@ -1836,7 +1920,7 @@ const COMMANDS = {
     trace: traceCmd,
 };
 
-const COMMAND_NAMES = 'ListWorkspaces、CreateProject、ListProjects、SearchProjects、GetProject、UpdateTodos、SubmitReport、DeleteProjects、RestoreProjects、PurgeProjects、ReadCode、EditCode、ResolveEdit、CreateFile、RemoveFile、MoveFile、MoveCode、CopyCode、Rollback、SearchHistory、GetNodeDiff、Outline、FindSymbol、Trace';
+const COMMAND_NAMES = 'ListWorkspaces、CreateProject、ListProjects、SearchProjects、GetProject、UpdateTodos、SubmitReport、DeleteProjects、RestoreProjects、PurgeProjects、ReadCode、EditCode、ResolveEdit、CreateFile、RemoveFile、MoveFile、MoveCode、CopyCode、Rollback、SearchHistory、GetNodeDiff、Outline、FindSymbol、Trace、EvalSymbol';
 
 const MUTATING_COMMANDS = new Set([
     'createproject', 'updatetodos', 'submitreport', 'deleteprojects',
@@ -2030,6 +2114,21 @@ const gui = {
             emitProjectChanged({ action: 'gui:revert', projectId: ctx.project.id, batchId, nodeId: newNodeId, maid });
             return { status: 'ok', ...plan, batchId, nodeId: newNodeId, maid };
         });
+    },
+    acceptProject(projectId, signature = '') {
+        const id = String(projectId || '').trim();
+        const project = guiProjectOf(id);
+        if (project.deleted_at) throw new Error(`${P} 已删除工程不能验收。`);
+        if (project.status === 'accepted') return { accepted: true, projectId: id };
+        if (project.status !== 'review') throw new Error(`${P} 只有待验收工程可以手动验收，请刷新列表。`);
+        const user = String(signature || '').trim() || '用户';
+        const record = `## 用户手动验收\n\n已由用户手动验收该工程。\n\n署名：${user} · 时间：${new Date().toISOString()}`;
+        store().updateProject(id, {
+            status: 'accepted',
+            report: [project.report, record].filter(Boolean).join('\n\n---\n\n'),
+        }, { touch: false }); // 验收不是施工进展：保持 updated_at，工程留在列表原位
+        emitProjectChanged({ action: 'gui:accept', projectId: id, maid: user });
+        return { accepted: true, projectId: id };
     },
     deleteProject(projectId, maid = '') {
         const id = String(projectId || '').trim();

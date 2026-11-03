@@ -12,21 +12,7 @@ let modulePromise = null;
 async function loadOrchestratorModule() {
     if (!modulePromise) {
         globalThis.TavernRulesEngine = engine;
-        const source = fs.readFileSync(
-            'modules/chat/singleChatRequestOrchestrator.js',
-            'utf8'
-        ).replace(/^import\s+['"]\.\.\/tavernRulesEngine\.js['"];\s*/m, '')
-            // data: URL 没有基准路径，相对 import 要换成绝对文件 URL 才能解析。
-            .replace(
-                /(['"])\.\.\/renderer\/toolResultRegions\.js\1/,
-                JSON.stringify(pathToFileURL(path.resolve('modules/renderer/toolResultRegions.js')).href)
-            ).replace(
-                /(['"])\.\/contextCompactionState\.js\1/,
-                JSON.stringify(pathToFileURL(path.resolve('modules/chat/contextCompactionState.js')).href)
-            );
-        modulePromise = import(
-            `data:text/javascript;base64,${Buffer.from(source).toString('base64')}`
-        );
+        modulePromise = import(pathToFileURL(path.resolve('modules/chat/singleChatRequestOrchestrator.js')).href);
     }
     return modulePromise;
 }
@@ -314,4 +300,27 @@ test('latest checkpoint replaces earlier outbound context and bypasses message t
     assert.equal(request.messages[0].content[0].text, raw);
     assert.equal(request.messages[0].__vcpContextCheckpoint, true);
     assert.equal(JSON.stringify(request.messages).includes('OLD'), false);
+});
+test('parallel window requests resolve their own agent and carry the same workspace snapshot', async () => {
+    const { createSingleChatRequestOrchestrator } = await loadOrchestratorModule();
+    const { api } = createApi({
+        resolveConversationContext: async owner => {
+            await new Promise(resolve => setTimeout(resolve, owner.id === 'a' ? 4 : 1));
+            return {
+                success: true, activeWorkspaceId: owner.id,
+                rules: [{ id: 'local', type: 'system_suffix', scope: 'agent', enabled: true, wrap: false, content: `RULE_${owner.id}` }],
+            };
+        },
+        expandWorkspacePlaceholders: async (text, snapshot) => ({
+            success: true, text: text.replace('{{VCPChatWorkSpace}}', `TREE_${snapshot.activeWorkspaceId}`),
+        }),
+        tavernGetRules: async () => { throw new Error('must not read global rules'); },
+    });
+    const orchestrator = createSingleChatRequestOrchestrator({ electronAPI: api, tavernEngine: engine });
+    const requests = await Promise.all(['a', 'b'].map(id => orchestrator.buildRequest({
+        settings: {}, agentConfig: { name: id, systemPrompt: '{{VCPChatWorkSpace}}' },
+        history: [], messageId: `m_${id}`, context: { agentId: id, topicId: `voicechat_${id}` },
+    })));
+    assert.equal(requests[0].messages[0].content, 'TREE_a\n\nRULE_a');
+    assert.equal(requests[1].messages[0].content, 'TREE_b\n\nRULE_b');
 });

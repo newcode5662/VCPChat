@@ -16,9 +16,11 @@
 const path = require('path');
 const fs = require('fs-extra');
 const outfitStore = require('./outfits');
+const { migratePortraits } = require('../services/portraitOptimizer');
 const { bundledCorePath } = require('./cubismCore');
 const { readWardrobe } = require('./live2dWardrobe');
 const { readCapabilities } = require('./live2dCapabilities');
+const { optimizeLive2DTextures } = require('./live2dTextureOptimizer');
 
 const SCHEME = 'vcp-deskpet';
 const IMAGE_EXTENSIONS = outfitStore.IMAGE_EXTENSIONS;
@@ -77,7 +79,7 @@ function createPetAssets({ paths, stagedCorePath = () => null }) {
         if (root === 'emotion') return guard(path.join(paths.projectRoot, 'modules', 'emotion'), segments);
         // 只放行朗读管线及其纯解析依赖，不暴露整个 modules 目录。
         if (root === 'renderer' && segments.length === 1 && [
-            'streamSpeech.js', 'streamStableBoundary.js', 'toolResultRegions.js',
+            'streamSpeech.js', 'streamStableBoundary.js', 'toolResultRegions.js', 'toolBatchRegions.js',
             'toolRequestScanner.js', 'markdownCodeDomainScanner.js',
         ].includes(segments[0])) return guard(path.join(paths.projectRoot, 'modules', 'renderer'), segments);
         // 助手自己没放头像时用应用的默认头像（和主窗口侧栏里显示的一样）
@@ -155,6 +157,7 @@ function createPetAssets({ paths, stagedCorePath = () => null }) {
 
     async function listOutfits(agentId) {
         const agentRoot = path.join(paths.agentDir, agentId);
+        await migratePortraits(agentRoot);
         let preferBuiltIn = false;
         try {
             const config = await fs.readJson(path.join(agentRoot, 'config.json'));
@@ -179,6 +182,9 @@ function createPetAssets({ paths, stagedCorePath = () => null }) {
 
         const outfits = await listOutfits(agentId);
         const outfit = outfitStore.pickOutfit(outfits, wantedOutfit);
+        if (outfit?.live2d && !outfit.builtIn) {
+            await optimizeLive2DTextures(outfit.live2d, path.join(agentRoot, 'deskpet'));
+        }
         // 选的这套没有立绘（Live2D、网格立绘）时，Live2D 用不了就退回助手目录的立绘
         const fallback = outfits.find((o) => o.id === outfitStore.PORTRAIT_ID)?.portraits || null;
         const avatar = IMAGE_EXTENSIONS.map((ext) => `avatar.${ext}`);

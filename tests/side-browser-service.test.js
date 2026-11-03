@@ -2,7 +2,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { SideBrowserService, webUrl } = require('../modules/loom/sideBrowserService');
+const { SideBrowserService, webUrl, resolveBrowserOpenRequest } = require('../modules/loom/sideBrowserService');
+const { sanitizeBrowserUserAgent } = require('../modules/ipc/browserHandlers');
 const protocol = require('../modules/loom/webcore/web-agent-protocol');
 
 function fixture() {
@@ -101,4 +102,48 @@ test('agent navigation rejects privileged protocols', () => {
         assert.throws(() => webUrl(url), { code: 'INVALID_REQUEST' });
     }
     assert.equal(webUrl('https://example.com'), 'https://example.com/');
+});
+
+test('pageInfo synchronizes adapter snapshot identity before strict actions', async () => {
+    const h = fixture();
+    const instance = h.service.resolve('browser:1');
+    let snapshotId = 0;
+    instance.view.webContents.executeJavaScriptInIsolatedWorld = async () => ({
+        markdown: 'page',
+        runtimeInstanceId: instance.webAgentAdapter.runtimeInstanceId,
+        documentGeneration: 1,
+        snapshotId: ++snapshotId,
+    });
+    const first = await h.service.pageInfo('browser:1');
+    assert.equal(instance.webAgentAdapter.snapshotId, first.snapshotId);
+    await h.service.execute('click', {
+        targetId: 'browser:1', target: '#button',
+        runtimeInstanceId: first.runtimeInstanceId,
+        documentGeneration: first.documentGeneration, snapshotId: first.snapshotId,
+    }, { strict: true });
+    const second = await h.service.pageInfo('browser:1');
+    assert.equal(instance.webAgentAdapter.snapshotId, second.snapshotId);
+    const before = h.calls.length;
+    await assert.rejects(h.service.execute('click', {
+        targetId: 'browser:1', target: '#button', snapshotId: first.snapshotId,
+    }, { strict: true }), { code: 'SNAPSHOT_MISMATCH' });
+    assert.equal(h.calls.length, before, 'stale context must fail before page dispatch');
+    await h.service.execute('click', {
+        targetId: 'browser:1', target: '#button', snapshotId: second.snapshotId,
+    }, { strict: true });
+});
+
+test('resolveBrowserOpenRequest supports flexible engine/query and sanitizeBrowserUserAgent strips Electron tokens', () => {
+    assert.deepEqual(resolveBrowserOpenRequest({}), { url: 'https://www.bing.com/', usePreferredEngine: true });
+    assert.deepEqual(resolveBrowserOpenRequest({ engine: 'google' }), { url: 'https://www.google.com/', engine: 'google' });
+    assert.deepEqual(resolveBrowserOpenRequest({ engine: 'google', query: 'vcp loom' }), {
+        url: 'https://www.google.com/search?q=vcp%20loom',
+        engine: 'google',
+        query: 'vcp loom',
+    });
+    assert.throws(() => resolveBrowserOpenRequest({ engine: 'unknown' }), { code: 'INVALID_REQUEST' });
+
+    const rawUa = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) vcp-chat-desktop/1.0.0 Chrome/152.0.7977.167 Electron/44.9.3 Safari/537.36';
+    const cleanUa = sanitizeBrowserUserAgent(rawUa);
+    assert.equal(cleanUa, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.7977.167 Safari/537.36');
 });
