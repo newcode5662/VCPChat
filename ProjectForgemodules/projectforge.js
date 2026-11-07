@@ -250,6 +250,7 @@ async function selectProject(projectId, { keepTab = false } = {}) {
     renderTimeline();
     renderFiles();
     renderReport();
+    if (document.querySelector('.tab.active')?.dataset.tab === 'blueprint') renderBlueprint({ force: true });
     if (!keepTab) switchTab('overview');
     $('history-results').innerHTML = '<p class="muted">输入条件后搜索本工程的变动历史。</p>';
 }
@@ -582,6 +583,55 @@ async function revertCurrent(mode) {
 function switchTab(name) {
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === name));
+    if (name === 'blueprint') renderBlueprint();
+}
+
+/** 工程图纸：动态画布（v 工程数据库实时投影，随施工自动生长）+ 手工精绘图（blueprints/{id}.html 存在时可切换）。
+ *  实时生长时：旧画布在 IPC 期间保持可见 → 离屏渲染 → 一次性替换 → 按阅读锚点还原滚动；并发调用只采纳最新一次。 */
+let bpRenderSeq = 0;
+async function renderBlueprint({ force = false } = {}) {
+    const pane = $('pane-blueprint');
+    const projectId = state.currentId;
+    if (!projectId) {
+        pane.innerHTML = '<p class="muted">未选择工程。</p>';
+        delete pane.dataset.loadedFor;
+        return;
+    }
+    if (!force && pane.dataset.loadedFor === projectId) return;
+    pane.dataset.loadedFor = projectId;
+    const seq = ++bpRenderSeq;
+    let manual = null;
+    try { manual = await call(api.projectForgeGetBlueprint(projectId)); } catch (_e) { manual = null; }
+    if (seq !== bpRenderSeq) return; // 已有更新的渲染请求，丢弃过期结果
+    const hasManual = !!(manual && manual.exists);
+    // bpGetViewMode / bpSetViewMode / renderBlueprintDynamic / bpCaptureScroll / bpRestoreScroll 来自 projectforge-blueprint.js（跨模块全局，与本文件其余兄弟模块同架构）
+    const mode = bpGetViewMode(projectId, hasManual);
+    const toggleHtml = hasManual ? `
+        <div class="bp-mode-bar">
+            <button class="bp-mode-btn${mode === 'dynamic' ? ' active' : ''}" data-bp-mode="dynamic" type="button">动态画布</button>
+            <button class="bp-mode-btn${mode === 'manual' ? ' active' : ''}" data-bp-mode="manual" type="button">精绘图</button>
+        </div>` : '';
+    if (mode === 'manual' && hasManual) {
+        pane.innerHTML = `${toggleHtml}<iframe class="bp-frame" src="../${escapeHtml(manual.relPath)}?t=${Date.now()}" title="改动脉络"></iframe>`;
+    } else {
+        const host = document.createElement('div');
+        host.className = 'bp-host';
+        host.dataset.project = projectId;
+        await renderBlueprintDynamic(host, projectId);
+        if (seq !== bpRenderSeq) return;
+        // 替换前一刻才取锚点：IPC 期间旧画布仍可滚动；仅旧画布属于同一工程时还原，换工程从顶部开始
+        const oldHost = pane.querySelector('.bp-host');
+        const anchor = oldHost && oldHost.dataset.project === projectId ? bpCaptureScroll(oldHost) : null;
+        pane.innerHTML = toggleHtml;
+        pane.appendChild(host);
+        bpRestoreScroll(host, anchor);
+    }
+    pane.querySelectorAll('.bp-mode-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            bpSetViewMode(projectId, btn.dataset.bpMode);
+            renderBlueprint({ force: true });
+        });
+    });
 }
 
 function debounce(fn, wait) {
