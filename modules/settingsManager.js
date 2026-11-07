@@ -932,6 +932,12 @@ const settingsManager = (() => {
     async function populateTtsModels(currentPrimaryVoice, currentSecondaryVoice) {
         if (!agentTtsVoicePrimarySelect || !agentTtsVoiceSecondarySelect) return;
 
+        const populateToken = agentSettingsPopulateToken;
+        const primarySelect = agentTtsVoicePrimarySelect;
+        const secondarySelect = agentTtsVoiceSecondarySelect;
+        const isCurrent = () => populateToken === agentSettingsPopulateToken
+            && primarySelect === agentTtsVoicePrimarySelect
+            && secondarySelect === agentTtsVoiceSecondarySelect;
         ensureThemedTtsSelects();
         const globalSettings = getGlobalSettings();
         const isNetworkMode = globalSettings.voiceMode === 'network';
@@ -949,6 +955,10 @@ const settingsManager = (() => {
                 ));
             if (!sameStructure) select.replaceChildren(...options);
             select.value = selectedValue || '';
+            // Property writes do not trigger MutationObserver or change.
+            // Refresh presentation only; loading an Agent must not dirty its form.
+            const EventCtor = select.ownerDocument?.defaultView?.CustomEvent ?? CustomEvent;
+            select.dispatchEvent(new EventCtor('vcp-uiux-sync', { bubbles: true }));
         };
 
         try {
@@ -957,6 +967,7 @@ const settingsManager = (() => {
             // Both local and network modes use the upstream TTS capability.
             // The retired WebIndexTTS2 catalog is no longer part of the runtime.
             const models = await electronAPI.sovitsGetModels();
+            if (!isCurrent()) return;
             if (Array.isArray(models)) {
                 optionList = models;
             } else if (models && typeof models === 'object') {
@@ -1032,7 +1043,7 @@ const settingsManager = (() => {
             const primaryOptions = createOptionGroups('不使用语音', currentPrimaryVoice);
             const secondaryOptions = createOptionGroups('不使用', currentSecondaryVoice);
             if (optionList.length === 0) {
-                const emptyLabel = isNetworkMode ? '未找到 MiMo 音色' : '未找到模型,请启动Sovits';
+                const emptyLabel = isNetworkMode ? '未找到 MiMo 音色' : '暂无预设，请在 sovits5cppmanager 创建';
                 primaryOptions.push(createOption('', emptyLabel, { disabled: true }));
                 secondaryOptions.push(createOption('', emptyLabel, { disabled: true }));
             }
@@ -1040,6 +1051,7 @@ const settingsManager = (() => {
             commitOptions(agentTtsVoiceSecondarySelect, secondaryOptions, currentSecondaryVoice);
             ensureThemedTtsSelects();
         } catch (error) {
+            if (!isCurrent()) return;
             console.error('Failed to get TTS models:', error);
             const errorLabel = isNetworkMode ? '获取网络音色失败' : '获取模型失败';
             const primaryErrorOption = document.createElement('option');
@@ -1053,7 +1065,7 @@ const settingsManager = (() => {
             commitOptions(agentTtsVoicePrimarySelect, [primaryErrorOption]);
             commitOptions(agentTtsVoiceSecondarySelect, [secondaryErrorOption]);
             ensureThemedTtsSelects();
-            uiHelper.showToastNotification(isNetworkMode ? '获取网络音色失败' : '获取Sovits语音模型失败', 'error');
+            uiHelper.showToastNotification(isNetworkMode ? '获取网络音色失败' : '读取 GSV 本地声音预设失败', 'error');
         }
     }
 

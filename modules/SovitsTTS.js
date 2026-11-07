@@ -3,7 +3,8 @@ const fs = require('fs').promises;
 const path = require('path');
 const crypto = require('crypto');
 
-const DEFAULT_SOVITS_API_BASE_URL = "http://127.0.0.1:8000";
+const { GsvPresetStore, synthesize: synthesizeGsv, digest: gsvDigest } = require('./voice/gsvPresets');
+const DEFAULT_SOVITS_API_BASE_URL = "http://127.0.0.1:9880";
 const DEFAULT_MIMO_API_URL = 'https://www.dmxapi.cn/v1/chat/completions';
 const DEFAULT_NETWORK_TTS_MODEL = 'mimo-v2.5-tts';
 const MIMO_VOICE_DESIGN_MODEL = `${DEFAULT_NETWORK_TTS_MODEL}-voicedesign`;
@@ -37,7 +38,7 @@ const MIMO_PRESET_VOICES = Object.freeze([
 // 修正路径问题，确保缓存和模型列表都在项目内的AppData目录
 const PROJECT_ROOT = path.join(__dirname, '..'); // 更可靠的方式获取项目根目录
 const APP_DATA_ROOT_IN_PROJECT = path.join(PROJECT_ROOT, 'AppData');
-const LOCAL_MODELS_CACHE_PATH = path.join(APP_DATA_ROOT_IN_PROJECT, 'sovits_local_models.json');
+
 const NETWORK_MODELS_CACHE_PATH = path.join(APP_DATA_ROOT_IN_PROJECT, 'sovits_network_models.json');
 const TTS_CACHE_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'tts_cache');
 const MIMO_CLONE_AUDIO_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'mimotts');
@@ -52,11 +53,10 @@ class SovitsTTS {
         // Map 保持插入顺序，用作最多两个参考音频的进程内 LRU。
         // value 中保存文件签名，用户替换同名文件后不会继续使用旧数据。
         this.cloneAudioMemory = new Map();
+        this.gsvStore = new GsvPresetStore();
+        this.cacheEpoch = 0;
+        this.cacheIo = Promise.resolve();
         this.initCacheDir();
-        // 调试探针：导出 TTS 各阶段文本（渲染端原文→正则分段→最终切块），定位内容被哪一环删除
-        this._debugDir = path.join(APP_DATA_ROOT_IN_PROJECT, 'tts_debug');
-        fs.mkdir(this._debugDir, { recursive: true }).catch(() => {});
-        this._debugSeq = 0;
     }
 
     async getRuntimeConfig() {
@@ -78,6 +78,7 @@ class SovitsTTS {
 
         return {
             voiceMode,
+            cacheEnabled: localConfig.cacheEnabled !== false,
             baseUrl: (configuredUrl || (voiceMode === 'network' ? DEFAULT_MIMO_API_URL : DEFAULT_SOVITS_API_BASE_URL))
                 .replace(/\/+$/, ''),
             apiKey: voiceMode === 'network'
@@ -283,6 +284,37 @@ class SovitsTTS {
         return headers;
     }
 
+    queueCacheIo(action) {
+        const work = this.cacheIo.then(action);
+        this.cacheIo = work.catch(() => {});
+        return work;
+    }
+
+    async clearAudioCache() {
+        ++this.cacheEpoch;
+        return this.queueCacheIo(async () => {
+            let removed = 0;
+            let entries;
+            try { entries = await fs.readdir(TTS_CACHE_DIR, { withFileTypes: true }); }
+            catch (error) { if (error.code === 'ENOENT') return { removed }; throw error; }
+            for (const entry of entries) {
+                // Only generated hash-named audio files; never recurse or follow symlinks.
+                if (!entry.isFile() || !/^(?:[a-f0-9]{32}|[a-f0-9]{64})\.(?:wav|mp3)$/i.test(entry.name)) continue;
+                try { await fs.unlink(path.join(TTS_CACHE_DIR, entry.name)); removed++; }
+                catch (error) { if (error.code !== 'ENOENT') throw error; }
+            }
+            return { removed };
+        });
+    }
+
+    async writeAudioCache(file, audio, epoch) {
+        return this.queueCacheIo(async () => {
+            if (epoch !== this.cacheEpoch) return;
+            await fs.mkdir(TTS_CACHE_DIR, { recursive: true });
+            await fs.writeFile(file, audio);
+        });
+    }
+
     async initCacheDir() {
         try {
             await Promise.all([
@@ -348,7 +380,7 @@ class SovitsTTS {
     async getModels(forceRefresh = false) {
         const runtimeConfig = await this.getRuntimeConfig();
         const isNetwork = runtimeConfig.voiceMode === 'network';
-        const cachePath = isNetwork ? NETWORK_MODELS_CACHE_PATH : LOCAL_MODELS_CACHE_PATH;
+
 
         // 网络模式同时提供 MiMo 预置音色、独立的自然语言控制模式，以及
         // AppData/mimotts 中扫描到的本地参考音频。克隆文件只暴露编码后的
@@ -386,40 +418,12 @@ class SovitsTTS {
             return mergedVoiceOptions;
         }
 
-        if (!forceRefresh) {
-            try {
-                const cachedModels = await fs.readFile(cachePath, 'utf-8');
-                console.log('从缓存加载本地 SoVITS 模型列表。');
-                return JSON.parse(cachedModels);
-            } catch (error) {
-                console.log('本地 SoVITS 模型缓存不存在或读取失败，将从 API 获取。');
-            }
-        }
-
-        try {
-            console.log(`正在从 ${runtimeConfig.baseUrl}/models 获取本地模型列表...`);
-            const response = await axios.post(`${runtimeConfig.baseUrl}/models`, { version: "v2ProPlus" }, {
-                headers: this.buildHeaders(runtimeConfig.apiKey)
-            });
-
-            if (response.data && response.data.msg === "获取成功" && response.data.models) {
-                await fs.writeFile(LOCAL_MODELS_CACHE_PATH, JSON.stringify(response.data.models, null, 2));
-                console.log('本地 SoVITS 模型列表已获取并缓存。');
-                return response.data.models;
-            } else {
-                console.error("获取本地 SoVITS 模型列表失败: ", response.data);
-                return null;
-            }
-        } catch (error) {
-            console.error('请求本地 SoVITS 模型列表 API 时出错: ', error.message);
-            try {
-                const cachedModels = await fs.readFile(cachePath, 'utf-8');
-                const parsedCache = JSON.parse(cachedModels);
-                return parsedCache;
-            } catch (e) {
-                return null;
-            }
-        }
+        return (await this.gsvStore.read()).presets.map(preset => ({
+            id: `gsv:${preset.id}`,
+            voice: `gsv:${preset.id}`,
+            displayName: preset.name,
+            type: 'gsv-preset'
+        }));
     }
 
     /**
@@ -432,7 +436,33 @@ class SovitsTTS {
      * @returns {Promise<{audioBuffer: Buffer, streamed: boolean}|null>} 音频结果
      */
     async textToSpeech(text, voice, speed, directorPrompts = [], onAudioChunk = null) {
+        const cacheEpoch = this.cacheEpoch;
         const runtimeConfig = await this.getRuntimeConfig();
+        if (runtimeConfig.voiceMode === 'local') {
+            try {
+                const preset = await this.gsvStore.resolve(voice);
+                // audio() verifies the immutable content hash before allowing a cache hit.
+                await this.gsvStore.audio(preset);
+                const identity = JSON.stringify(['gsv-v1', runtimeConfig.baseUrl, preset, text, Number(speed) || 1]);
+                const cacheFile = path.join(TTS_CACHE_DIR, `${gsvDigest(identity)}.wav`);
+                if (runtimeConfig.cacheEnabled) {
+                    try { return { audioBuffer: await fs.readFile(cacheFile), streamed: false }; }
+                    catch (error) { if (error.code !== 'ENOENT') throw error; }
+                }
+                const audioBuffer = await synthesizeGsv({
+                    store: this.gsvStore, preset, baseUrl: runtimeConfig.baseUrl,
+                    apiKey: runtimeConfig.apiKey, text, speed: Number(speed) || 1
+                });
+                if (runtimeConfig.cacheEnabled) {
+                    try { await this.writeAudioCache(cacheFile, audioBuffer, cacheEpoch); }
+                    catch (error) { console.warn('[GSV] Cache write failed:', error.message); }
+                }
+                return { audioBuffer, streamed: false };
+            } catch (error) {
+                console.error('[GSV] Synthesis failed:', error.message);
+                return null;
+            }
+        }
         const promptSignature = Array.isArray(directorPrompts) ? directorPrompts.join('\n') : '';
         const cacheKey = crypto.createHash('md5')
             .update([runtimeConfig.voiceMode, runtimeConfig.baseUrl, text, voice, speed, promptSignature].join('\0'))
@@ -460,67 +490,11 @@ class SovitsTTS {
                     directorPrompts,
                     onAudioChunk
                 );
-                await fs.writeFile(cacheFilePath, audioBuffer);
+                await this.writeAudioCache(cacheFilePath, audioBuffer, cacheEpoch);
                 return { audioBuffer, streamed: typeof onAudioChunk === 'function' };
             }
 
-            let payload;
-            let endpoint;
-            {
-                let promptLang = "中文";
-                if (voice.includes('日语')) {
-                    promptLang = "日语";
-                }
-
-                payload = {
-                    model: "tts-v2ProPlus",
-                    input: text,
-                    voice: voice,
-                    response_format: "mp3",
-                    speed: speed,
-                    other_params: {
-                        text_lang: promptLang === "日语" ? "日语" : "中英混合",
-                        prompt_lang: promptLang,
-                        emotion: "默认",
-                        text_split_method: "按标点符号切",
-                    }
-                };
-                endpoint = '/v1/audio/speech';
-            }
-
-            console.log('[TTS] 发送本地 SoVITS API 请求:', JSON.stringify({
-                baseUrl: runtimeConfig.baseUrl,
-                payload
-            }));
-
-            const response = await axios.post(`${runtimeConfig.baseUrl}${endpoint}`, payload, {
-                responseType: 'arraybuffer',
-                headers: this.buildHeaders(runtimeConfig.apiKey),
-                validateStatus: () => true
-            });
-
-            if (response.status < 200 || response.status >= 300) {
-                const errorBody = Buffer.from(response.data || []).toString('utf8');
-                console.error("[TTS] 请求语音合成API时出错:", `status=${response.status}`, errorBody);
-                return null;
-            }
-
-            console.log(`[TTS]收到API响应: 状态 ${response.status}, 类型 ${response.headers['content-type']}`);
-
-            if ((response.headers['content-type'] || '').includes('audio/')) {
-                const audioBuffer = Buffer.from(response.data);
-                try {
-                    await fs.writeFile(cacheFilePath, audioBuffer);
-                    console.log(`[TTS] 音频已成功缓存: ${cacheKey}`);
-                } catch (cacheError) {
-                    console.error("[TTS] 保存音频缓存失败:", cacheError);
-                }
-                return { audioBuffer, streamed: false };
-            } else {
-                const nonAudioBody = Buffer.from(response.data || []).toString('utf8');
-                console.error("[TTS] API没有返回正确的音频文件类型。", nonAudioBody);
-                return null;
-            }
+            throw new Error('Unexpected local TTS branch');
         } catch (error) {
             console.error("[TTS] 请求语音合成API时出错: ", error.message);
             return null;
@@ -543,44 +517,51 @@ class SovitsTTS {
             return [];
         }
 
-        // GPT-SoVITS v2Pro 音色对 chunk 长度极其敏感：
-        //   <15 字：AR 高概率首步 EOS，整段静音；
-        //   >45 字：长上下文 AR 会随机提前 EOS，吞掉中间整句；
-        //   20~40 字：稳定区。
-        // 因此先把全文按句末标点逐句切开，再贪心装包：每包达到 MIN_CHUNK_LEN
-        // 即封口；下一句并入会超过 MAX_CHUNK_LEN 时也封口，保证每块落在稳定区间。
-        const MIN_CHUNK_LEN = 18;
-        const MAX_CHUNK_LEN = 42;
-
-        const sentences = [];
-        const sentenceRegex = /[^。！？.!?\n]+[。！？.!?]?/g;
-        let match;
-        while ((match = sentenceRegex.exec(trimmedText)) !== null) {
-            const sentence = match[0].trim();
-            if (sentence) sentences.push(sentence);
-        }
+        // 1. 找到第一个换行符的位置，以此划分第一段和其余段落
+        const firstNewlineIndex = trimmedText.indexOf('\n');
+        const firstParagraph = (firstNewlineIndex === -1) ? trimmedText : trimmedText.substring(0, firstNewlineIndex);
+        const otherParagraphs = (firstNewlineIndex === -1) ? '' : trimmedText.substring(firstNewlineIndex + 1);
 
         const chunks = [];
-        let current = '';
-        for (const sentence of sentences) {
-            if (current && current.length >= MIN_CHUNK_LEN
-                && current.length + sentence.length > MAX_CHUNK_LEN) {
-                chunks.push(current);
-                current = sentence;
-            } else {
-                // current 不足下限必须继续吞并（短块会静音）；
-                // 单句本身超长时无法再拆，只能独占一块。
-                current += sentence;
+
+        // 2. 处理第一段：分离出第一句
+        // 正则表达式：匹配直到第一个中/英文句号、问号或感叹号。非贪婪匹配。
+        const sentenceEndRegex = /.+?[。！？.!?]/;
+        const match = firstParagraph.match(sentenceEndRegex);
+
+        if (match) {
+            let firstChunk = match[0];
+            let restOfFirstParagraph = firstParagraph.substring(firstChunk.length).trim();
+
+            // 新增逻辑：如果第一句以感叹号结尾，并且后面还有内容，则尝试合并下一句
+            if (/[!！]$/.test(firstChunk) && restOfFirstParagraph) {
+                const nextSentenceMatch = restOfFirstParagraph.match(sentenceEndRegex);
+                if (nextSentenceMatch) {
+                    const nextSentence = nextSentenceMatch[0];
+                    firstChunk += nextSentence; // 合并
+                    restOfFirstParagraph = restOfFirstParagraph.substring(nextSentence.length).trim();
+                }
+            }
+
+            chunks.push(firstChunk);
+
+            if (restOfFirstParagraph) {
+                chunks.push(restOfFirstParagraph);
+            }
+        } else {
+            // 如果第一段没有标点，则将整个第一段作为一个块
+            if (firstParagraph.trim()) {
+                chunks.push(firstParagraph.trim());
             }
         }
-        if (current) chunks.push(current);
 
-        // 末尾若仍是短块（如全文只有一句短句），并入前一块。
-        while (chunks.length > 1 && chunks[chunks.length - 1].length < MIN_CHUNK_LEN) {
-            chunks[chunks.length - 2] += chunks[chunks.length - 1];
-            chunks.pop();
+        // 3. 处理其余段落
+        if (otherParagraphs.trim()) {
+            const restChunks = otherParagraphs.split('\n').filter(line => line.trim() !== '');
+            chunks.push(...restChunks);
         }
-        return chunks;
+
+        return chunks.filter(c => c.length > 0);
     }
 
     /**
@@ -645,51 +626,6 @@ class SovitsTTS {
     }
 
     /**
-     * 调试探针：把一次朗读的三个阶段文本落盘
-     * 渲染端原文(extractText 产物) → ttsRegex 分段后 → splitText 最终切块
-     * 文件：AppData/tts_debug/speak_时间戳_序号.txt
-     */
-    async _dumpSpeakPipeline(stage) {
-        try {
-            this._debugSeq += 1;
-            const d = new Date();
-            const p2 = (n) => String(n).padStart(2, '0');
-            const p3 = (n) => String(n).padStart(3, '0');
-            const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}_${p3(d.getMilliseconds())}`;
-            const file = path.join(this._debugDir, `speak_${stamp}_${this._debugSeq}.txt`);
-            const out = [];
-            out.push('# meta');
-            out.push(JSON.stringify({
-                voice: stage.voice,
-                voiceSecondary: stage.voiceSecondary || null,
-                ttsRegex: stage.regex || null,
-                ttsRegexSecondary: stage.regexSecondary || null,
-                originalLen: stage.originalText.length,
-                segmentCount: stage.segments.length,
-                taskCount: stage.tasks.length
-            }, null, 2));
-            out.push('');
-            out.push(`# original from renderer (len=${stage.originalText.length}) >>>`);
-            out.push(stage.originalText);
-            out.push('');
-            out.push('# after _segmentTextForBilingualTTS (ttsRegex applied) >>>');
-            stage.segments.forEach((seg, i) => {
-                out.push(`--- segment[${i}] lang=${seg.lang} len=${seg.text.length} ---`);
-                out.push(seg.text);
-            });
-            out.push('');
-            out.push('# final chunks posted to GPT-SoVITS >>>');
-            stage.tasks.forEach((t, i) => {
-                out.push(`--- chunk[${i}] voice=${t.voice} len=${t.text.length} ---`);
-                out.push(t.text);
-            });
-            await fs.writeFile(file, out.join('\n') + '\n', 'utf-8');
-            console.log(`[TTS] 调试快照已导出: ${file}`);
-        } catch (error) {
-            console.warn('[TTS] 调试快照导出失败:', error.message);
-        }
-    }
-    /**
      * 开始双语朗读任务
      * @param {object} options 包含所有朗读参数
      */
@@ -732,16 +668,6 @@ class SovitsTTS {
                 sender // Pass sender to each task
             }));
         }).flat(); // Flatten the array of arrays
-
-        this._dumpSpeakPipeline({
-            originalText: text,
-            voice,
-            voiceSecondary,
-            regex: ttsRegex,
-            regexSecondary: ttsRegexSecondary,
-            segments,
-            tasks
-        });
 
         this.speechQueue.push(...tasks);
         
