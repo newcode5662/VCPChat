@@ -331,7 +331,9 @@ const NATIVE_SPLASH_READY_FILE = app.isPackaged
 const AGENT_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'Agents');
 const USER_DATA_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'UserData'); // For chat histories and attachments
 const SETTINGS_FILE = path.join(APP_DATA_ROOT_IN_PROJECT, 'settings.json');
-const TERMINAL_EXECUTOR_PATH = path.join(PROJECT_ROOT, 'VCPDistributedServer', 'Plugin', 'PowerShellExecutor', 'PowerShellExecutor.js');
+// 诊断只观察缓存，不加载执行器；Windows 与非 Windows 的后端都必须计入。
+const TERMINAL_EXECUTOR_PATHS = ['PowerShellExecutor', 'PTYShellExecutor'].map(name =>
+    path.join(PROJECT_ROOT, 'VCPDistributedServer', 'Plugin', name, `${name}.js`));
 const USER_AVATAR_FILE = path.join(USER_DATA_DIR, 'user_avatar.png'); // Standardized user avatar file
 const MUSIC_PLAYLIST_FILE = path.join(APP_DATA_ROOT_IN_PROJECT, 'songlist.json');
 const MUSIC_COVER_CACHE_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'MusicCoverCache');
@@ -353,6 +355,8 @@ let distributedServer = null; // To hold the distributed server instance
 let distributedServerStartPromise = null;
 let chatDataService = null; // Optional VCP-CDS shadow service.
 let historyMutationQueue = null;
+let topicAdmissionHost = null;
+let topicConversationResolver = null;
 let pluginAgentOperationService = null;
 let chartService = null;
 let gameService = null;
@@ -769,6 +773,9 @@ async function performQuitCleanup() {
         }
 
         workspaceHandlers.dispose();
+        await topicAdmissionHost?.dispose?.();
+        topicAdmissionHost = null;
+        topicConversationResolver = null;
         await historyMutationQueue?.dispose?.();
         historyMutationQueue = null;
         pluginAgentOperationService = null;
@@ -1261,7 +1268,29 @@ if (!gotTheLock) {
             fileWatcher,
             logger: console
         });
+        const { createTopicConversationResolver } = require('./modules/services/topicConversationResolver');
+        const { createTopicMessageAdmissionHost } = require('./modules/services/topicMessageAdmissionHost');
+        topicConversationResolver = createTopicConversationResolver({
+            agentDir: AGENT_DIR,
+            groupDir: path.join(APP_DATA_ROOT_IN_PROJECT, 'AgentGroups'),
+            userDataDir: USER_DATA_DIR,
+        });
+        topicAdmissionHost = await createTopicMessageAdmissionHost({
+            appDataRoot: APP_DATA_ROOT_IN_PROJECT,
+            historyQueue: historyMutationQueue,
+            validate: scope => topicConversationResolver.validate(scope),
+            getMainWindow: () => mainWindow,
+            advanceGroup: request => groupChatHandlers.advanceTopicAdmission(request),
+            ipcMain,
+        });
+        const { createTopicSponsorDelivery } = require('./modules/services/topicSponsorDelivery');
+        const topicDelivery = createTopicSponsorDelivery({
+            admission: topicAdmissionHost.service,
+            resolver: topicConversationResolver,
+            findAgent: query => pluginAgentOperationService.findAgent(query),
+        });
         pluginAgentOperationService = new PluginAgentOperationService({
+            topicDelivery,
             agentDir: AGENT_DIR,
             userDataDir: USER_DATA_DIR,
             agentConfigManager,
@@ -1687,7 +1716,8 @@ if (!gotTheLock) {
             stopSelectionListener: assistantHandlers.stopSelectionListener,
             startSelectionListener: assistantHandlers.startSelectionListener,
             settingsManager: appSettingsManager,
-            agentConfigManager
+            agentConfigManager,
+            historyMutationQueue
         });
 
         await assistantHandlers.initialize({ SETTINGS_FILE });
@@ -1712,6 +1742,7 @@ if (!gotTheLock) {
             startSelectionListener: assistantHandlers.startSelectionListener,
             fileWatcher, // Inject fileWatcher here as well
             historyMutationQueue,
+            topicAdmission: topicAdmissionHost.service,
             jevService: globalJevService,
             gameService
         });
@@ -1913,7 +1944,7 @@ if (!gotTheLock) {
                 launch: launchMarks.snapshot(),
                 // 终端执行器是否已在主进程加载：侧栏终端第一次用到才 require；分布式服务器开着时它的插件加载也会拉起它
                 terminalExecutor: {
-                    loaded: Boolean(originalRequire.cache[TERMINAL_EXECUTOR_PATH]),
+                    loaded: TERMINAL_EXECUTOR_PATHS.some(executorPath => Boolean(originalRequire.cache[executorPath])),
                     distributedServer: Boolean(distributedServer),
                 },
             };
