@@ -1313,6 +1313,7 @@ async function handleRegenerateResponseOwned(originalAssistantMessage, admission
         });
         const modelConfigForVCP = {
             model: agentConfig.model,
+            ...(agentConfig.reasoningSelection ? { reasoningSelection: structuredClone(agentConfig.reasoningSelection) } : {}),
             temperature: parseFloat(agentConfig.temperature),
             max_tokens: agentConfig.maxOutputTokens ? parseInt(agentConfig.maxOutputTokens) : undefined,
             contextTokenLimit: agentConfig.contextTokenLimit ? parseInt(agentConfig.contextTokenLimit) : undefined,

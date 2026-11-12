@@ -6,11 +6,33 @@
       "name": "Agent输出动画气泡",
       "type": "system_suffix",
       "enabled": false,
-      "content": "输出规范要求：{{VarDivRender}}",
+      "content": "输出规范要求：{{VarRendering}}\n",
       "scope": "global",
       "wrap": true,
       "builtinKey": "agent-div-render",
       "order": 0
+    },
+    {
+      "id": "builtin_project_forge-upstream",
+      "name": "V工程",
+      "type": "system_suffix",
+      "enabled": false,
+      "content": "# V工程协作与代码施工（ProjectForge）\n\n用于创建工程、管理待办、调查代码、修改文件及追踪回退。工具名：`ProjectForge`。标准 VCP 调用格式见置顶，署名使用自己的 `maid` 或 `valet`；调查及施工推荐 `ink=mark_history`。\n\n下文 `命令(参数)` 为速查：命令填入 `command`，参数分别作为字段；`?` 表示可选。不要按函数语法调用。\n\n## 1. 操作入口\n\n- 文件路径相对**工程根**；`workspace` 是已登记工作区别名，`dir` 是工作区内子目录。\n- 先查现有工程；创建后使用返回的真实 `projectId`。\n- 已知文件或符号直接读取，不必先全仓库搜索。\n- 同文件多处修改优先一次批处理，不并发独立写入。\n- ProjectForge 负责工程调查、编辑及历史；测试、构建、Git 使用对应 CLI 工具。\n\n常用流程：\n\n```text\nListProjects / CreateProject → GetProject\n→ ReadCode / FindSymbol / Outline / Trace\n→ EditCode / CreateFile / MoveCode\n→ 检查差分、运行相关测试 → SubmitReport\n```\n\n按任务跳过不需要的步骤。\n\n## 2. 工程与待办\n\n```text\nListWorkspaces()\nListProjects(workspace?, query?, includeDeleted?)\nCreateProject(name, workspace?, dir?, todos?)\nGetProject(projectId, timeline?)\nUpdateTodos(projectId, add?, done?, doing?, pending?, blocked?,\n            remove?, seq?, title?, note?)\nSubmitReport(projectId, conclusion, issues?, status?)\n```\n\n- `ListWorkspaces` 查询工作区别名及真实路径。\n- `ListProjects` 可按工作区或关键词筛选；`includeDeleted=true` 包含软删工程。\n- `todos/add` 用换行或逗号分隔。\n- 待办状态及移除字段使用序号列表，如 `1,3`；`seq + title/note` 修改指定项。\n- `GetProject` 查看待办、改动、开发脉络和报告；`timeline` 默认 8。\n- 报告 `status=review|accepted|active`，默认 review；提交报告不等于已经验收。\n\n## 3. 读取、符号与链路调查\n\n```text\nReadCode(projectId, path?|paths?|glob?, lines?, showLine?, find?,\n         symbol?, range?, context?, pick?, line?)\nOutline(projectId, path?|paths?, depth?, kind?)\nFindSymbol(projectId, name, kind?, glob?, exact?, limit?, scope?)\nTrace(projectId, target, scope?, glob?)\n```\n\n### ReadCode：读取源码与资产\n\n```text\npath=src/a.js\npath=src/a.js:40-80\npath=src/a.js#Store.putBlob\n```\n\n也可使用 `path + symbol`。\n\n- `paths`：换行或逗号分隔多个文件；`glob`：批量选择。\n- `lines=head:N|tail:N|M-N|N`；默认带行号，`showLine=false` 关闭。\n- `find` 按字面量查找（同 EditCode target 规则，忽略行首尾空白），返回匹配行、所在函数及上下文；多个关键词写 `a|b` 取并集，`\\|` 匹配字面竖线，`||` 始终按字面量，多行查询不拆分。\n- 符号默认包含紧邻注释/装饰器；`range=body` 从签名开始；`context` 扩展上下文。\n- 同名候选用 `pick` 或近似 `line` 消歧。\n- 支持 JS/TS/TSX/Python/Rust 符号读取；资产支持多模态及文档提取。\n\n### Outline / FindSymbol\n\n- Outline 查看符号层级和行范围。\n- FindSymbol 按 AST 定位定义；`exact=true` 精确或限定名后缀匹配。\n- `limit` 默认 20，最大 500。\n- 返回的 `文件#限定名` 可用于后续读取、编辑。\n- `scope=workspace` 扩大符号搜索；工程外结果只读。\n\n### Trace\n\n`target` 格式：\n\n```text\nipc:通道\napi:preloadAPI\nglobal:名称\npage:页面.html\nfile:相对路径\n```\n\n调查处理端、调用端、声明、页面加载顺序及依赖。`scope=workspace` 扩大范围，`glob` 限定文件。动态调用可能不生成确定边，未发现静态关系不等于不存在运行时调用。\n\n## 4. 编辑代码\n\n```text\nEditCode(projectId, path, reason, 编辑字段,\n         todo?, mode?, revertOnSyntaxError?)\n```\n\n| 操作 | 编辑字段 |\n|---|---|\n| 文本替换 | `target, replace` |\n| 替换行 | `start, end, content` 或 `lines, content` |\n| 插入 | `op=insert, after=N|end` 或 `before=N`，配合 `content` |\n| 删除行 | `op=delete, start, end` |\n| 替换符号 | `path=文件#符号, content` 或 `path + symbol + content` |\n| 删除符号 | `op=delete, symbol` |\n| 符号前后插入 | `op=insert, before=symbol:名称` 或 `after=symbol:名称`，配合 `content` |\n\n- `reason` 说明修改原因；`todo` 关联待办。\n- `after=0` 插入文件开头。\n- `expect` 校验原文，允许在 ±20 行内定位校正。\n- 首尾锚定：`target` 写首行、独立一行 `...`、尾行；支持 `N | 原文` 行号前缀。空 `replace` 删除匹配区间。\n- 符号编辑默认包含前置注释；`range=body` 保留注释。\n- `mode=atomic` 默认全部成功才写；`bestEffort` 跳过失败步骤。\n- `revertOnSyntaxError=true` 阻止引入语法错误，不代替编译或测试。\n\n### 同文件多步编辑\n\n使用数字后缀：\n\n```text\ntarget1, replace1\nop2, start2, end2, content2\nsymbol3, content3\n```\n\n`projectId/path` 共用；可提供 `reasonN`。**所有步骤均基于编辑前快照，行号不计算偏移，重叠区间报错。**\n\n### 多处匹配消歧\n\n多处匹配时不会直接写入；读取候选后调用：\n\n```text\nResolveEdit(ticketId, pick)\n```\n\n- 单步 `pick=2`、`1,3` 或 `all`。\n- 多步 `pick=2:1;5:3`，表示“步骤:候选”。\n- 票据有效 30 分钟；文件变化可能返回新候选。\n\n## 5. 文件与代码块\n\n### 文件操作\n\n```text\nCreateFile(projectId, path, content, reason,\n           overwrite?, todo?, revertOnSyntaxError?)\nRemoveFile(projectId, path?|paths?, reason)\nMoveFile(projectId, from, to, reason)\n```\n\n- CreateFile 自动创建父目录；同名默认拒绝，`overwrite=true` 先存快照再覆盖。\n- RemoveFile 先存快照，再移入回收站。\n- MoveFile 用于移动或重命名；目标存在则拒绝。\n- 此处 MoveFile 使用 `from/to`，不是 FileOperator 的 `sourcePath/destinationPath`。\n\n### 移动或复制代码块\n\n```text\nMoveCode / CopyCode\n  projectId, from, reason, to?,\n  lines?|start/end?|target?|symbol?,\n  expect?, range?, pick?, line?,\n  after?|before?, indent?, todo?, revertOnSyntaxError?\n```\n\n- 源块：`from=文件:M-N`、`from=文件#符号`，或另传对应定位字段。\n- `to` 省略表示同文件；目标文件不存在则新建。\n- 目标位置：`after=N|end`、`before=N` 或 `symbol:名称` 锚点。\n- 默认包含前置注释；`range=body` 除外。\n- `indent=auto|keep|N|+N|-N`。\n- 同文件移动使用操作前行号；跨文件变更归同一批次。\n- CopyCode 复制代码块，不是整文件复制。\n\n### 6. 函数试跑\n\nEvalSymbol(projectId, path, args?, kwargs?, setup?, timeoutMs?,\n           symbol?, pick?, line?, package?, features?, target?, testPick?)\n\n- path=文件#符号；复用 AST 定位，pick/line 消歧。\n- JS/CJS/ESM：调用真实导出函数/对象方法，保留 this。\n- Python：按包导入；kwargs 为关键字参数对象。\n- Rust：仅运行已有标准 #[test]；package/features 限定构建，target/testPick 消歧执行目标。零命中、ignored 不算通过。\n- args 为 JSON 数组，默认 []；setup 为对应语言的异步准备函数体，返回参数数组，与 args 互斥；不支持 Rust setup。\n- timeoutMs：JS/Py 默认 5000，Rust 默认 100000，上限 110000。\n- returned=函数成功返回，不等于测试通过；passed=实际测试通过。失败按阶段返回，details 含 typed-v1 值、运行时、目标源码 hash 与有界日志。\n- 工程根 .projectforge-eval.json 可指定 node/python/cargo；Python 按配置→.venv→PATH 选择，失败不换环境。\n- 仅限可信、可写工程；不是安全沙箱，加载与执行可能产生副作用。TS、局部闭包、自动构造实例及 Rust 临时 harness 不支持。\n\n\n## 7. 历史、差分与回退\n\n```text\nSearchHistory(projectId?, file?, keyword?, content?, byMaid?,\n              todo?, op?, batch?, since?, until?, limit?)\nGetNodeDiff(projectId, node?|batch?, maxLines?)\nRollback(projectId, batch?|toNode?, path?, dryRun?, force?, reason?)\n```\n\n- 历史 `op=create|edit|delete|move|rollback|external`。\n- 操作者筛选字段仍叫 `byMaid`，即使使用 valet 署名也不改字段名。\n- Diff 选择 `node` 或 `batch`。\n- Rollback 选择 `batch` 或 `toNode`；`batch=last` 撤销最近批次，`toNode + path` 恢复单文件。\n- `dryRun=true` 预演；冲突默认拒绝。\n- `force=true` 覆盖冲突前保存当前快照，使用前确认覆盖范围。\n\n## 8. 工程记录清理\n\n```text\nDeleteProjects(projectIds)\nRestoreProjects(projectIds)\nPurgeProjects(projectIds, confirm=true)\n```\n\n`projectIds` 用逗号或换行分隔。\n\n- Delete/Restore 只软删或恢复工程数据库记录，不改磁盘文件。\n- Purge 仅处理已软删工程，永久清除记录及历史快照，不删除磁盘文件；清除后不能通过这些快照回退。",
+      "scope": "global",
+      "wrap": true,
+      "builtinKey": "project-forge-upstream",
+      "order": 2
+    },
+    {
+      "id": "builtin_topic_sponsor",
+      "name": "多话题交互",
+      "type": "system_suffix",
+      "enabled": false,
+      "content": "—— TopicSponsor多话题交互能力——\n工具名：TopicSponsor\n  // 一、服务发现与路由寻址 (自主私信前置)\n  ListAgents()                                             // 只读列出全量注册 Agent (name/id/type)\n  ListGroups()                                             // 只读列出全量群聊 (name/id/type)\n  ListRecentTopics(query, target_type?:'agent'|'group')    // 查最新5个话题取topic_id；query传ID或名称(支持模糊匹配)\n\n  // 二、话题创生与心流派发\n  CreateTopic(topic_name, initial_message, maid?)\n  CreateFlowlockTopic(topic_name, initial_message, maid?, flowlock_heartbeat?:number, flowlock_prompt?)\n\n  // 三、感知与状态嗅探\n  ListUnlockedTopics(maid)\n  ReadUnlockedTopics(maid, include_read?:boolean)          // include_read 默认 false（仅未读）\n  CheckNewTopics(maid, days?:number)                      // days 默认 3\n  CheckUnreadMessages(maid)\n  CheckTopicOwnership(topic_id, caller_name, maid?)\n\n  // 四、跨域留言与内容审阅\n  ReadTopicContent(topic_id, maid?)                       // 读取指定话题完整历史流\n  ReplyToTopic(topic_id, message, sender_name|sender_id, source_topic_id?)",
+      "scope": "global",
+      "wrap": false,
+      "builtinKey": "topic-sponsor",
+      "order": 3
     },
     {
       "id": "builtin_flowlock",
@@ -21,29 +43,73 @@
       "scope": "agent",
       "wrap": false,
       "builtinKey": "flowlock",
-      "order": 1
+      "order": 4
     },
     {
-      "id": "builtin_loom",
-      "name": "Loom权限",
+      "id": "builtin_window_control",
+      "name": "窗口控制权限",
       "type": "system_suffix",
       "enabled": false,
-      "content": "—— VCP Loom Agent 控制器 (LoomController) ——\n通则：所有命令统一 tool_name:'LoomController'。侧栏浏览器固定 appId:'vcpchat-browser' 且须带 targetId；LoomAPP 使用其注册的 appId。支持编号串行批处理(command1/target1/text1, command2/waitMs2...)。\n\n一、 官方侧栏浏览器 (Browser & Human-in-the-loop)\n- 启动/标签：`OpenVCPChatBrowser(url)` (返回appId与targetId)；`list_tabs()`；`switch_tab(targetId)`；`close_tab(targetId?)`；`open_url(url)`\n- 人工接管：`RequestBrowserAssistance(targetId, message:求助原因)` (遇验证码/登录时挂起等待，严禁并发写操作)\n\n二、 页面感知与多模态 (Perception)\n*动作前必须先通过快照获取 target 元素句柄*\n- 核心快照：`GetPageInfo(appId, targetId?)` (获取Grounded Markdown、DOM元素句柄与documentGeneration)\n- 文本/源码：`GetRenderedText(appId, targetId?, refresh?:true)`；`GetRuntimeSource(appId, targetId?)`\n- 多模态截取：`GetPageImage(appId, imageId:'IMG1'|'vcp-img-*', targetId?, format?:'jpeg', quality?:85)`\n\n三、 页面原子交互与高级动作 (Actions)\n*公共可选校验参数：snapshotId?, strict?, runtimeInstanceId?*\n- 点击/输入：`click(appId, target, targetId?)`；`type(appId, target, text, targetId?)`；`set_value(appId, target, value)`\n- 键盘/悬停：`send_keys(appId, keys:'Enter'|'Ctrl+A', target?, targetId?)`；`hover(appId, target)`；`check(appId, target, checked?:true)`\n- 下拉/滚动：`select_option(appId, target, value?|text?|index?)`；`scroll(appId, direction:'down'|'up'|'bottom'|'top', amount?, target?)`\n- 智能等待：`wait_for(appId, condition:'dom_stable'|'element'|'visible'|'text', target?, stableMs?:800, timeoutMs?)`\n- 通用动作/CDP：`ExecuteAction(appId, actionId, params?:{}, options?:{})`\n\n四、 LoomAPP 容器管理 (App Lifecycle)\n- 应用状态：`ListApps()`；`ListOpenApps()`；`OpenApp(appId)`；`CloseApp(appId)`；`ReloadPage(appId)`；`NavigateBack/Forward/Home(appId)`\n- 源码管理：`GetAppSources(appId)`\n- 应用创建：`CreateApp(manifest:JSON, css?:string, js?:string)`\n  *manifest核心：{id, name, startUrl, enabled:true, window:{width, height}, viewport, request:{profile:'mobile'|'desktop'}, iconSource?:{type:'canvas'|'svg', ...}}*\n- 运行时编辑：`EditAppSources(appId, manifest?:JSON, css?:string, js?:string)` (支持热更新)\n\n五、 Skill 持久化技能引擎 (Skill Engine)\n- 创建编译：`CreateSkill(skillId, appId, title, description?, placeholders:{\"var\":{\"description\", \"required\":true}}, validationMode?:'current'|'trial'|'none', command1, target1, text1:{{var}}...)`\n- 技能运维：`ManageSkill(operation:'list'|'get'|'delete', skillId?)`；`EditSkill(skillId, ...)`\n- 执行派发：`ExecuteSkill(skillId, inputs:JSON, mode?:'sync'|'async')` (长任务选async并由GetSkillTask查询)；`GetSkillTask(taskId)`\n",
-      "scope": "global",
+      "content": "—— 窗口感知器 (CapturePreprocessor) ——\n{{VCPProcessList}}\n（按需即时注入占位符：`{{VCPScreenShot}}`、`{{VCPScreenShotMini}}`、`{{VCPScreenShot:窗口标题或HWND或[含标点长标题]}}`、`{{VCPCameraCapture(1)}}`）\n\n—— 屏幕视觉与操控 (ScreenPilot) ——\n通则：统一 `tool_name:'ScreenPilot'`，支持串行批处理(`command1/windowTitle1, command2...`)。\n窗口选择器(任选其一)：`hwnd?:整数(最优先), windowTitle?:标题模糊词, processName?:进程名(如'YuanShen.exe'), pid?:整数, className?:类名`。\n双轨原则：提供窗口选择器时，点击/输入/滚动支持后台静默执行(`background:true` 或 SendMessage/WM_CHAR)，不抢物理键鼠焦点。\n\n一、 视觉、时序拼图与 UI 树感知\n- 单帧截图：`ScreenCapture(format?:'jpeg'|'png', quality?:85, ocr?:false, save?:false, filename?, [窗口选择器])`\n- 时序双卷轴拼图：`ContactSheet(interval?:2.0, max_frames?:24, flush?:false, flush_remaining?:false, quality?:85, [窗口选择器])`；采样控制：`StopSampler(clear?:false)` | `FlushSampler()`\n- UI 自动化树：`InspectUI(controlType?:'Button'|'Edit', maxDepth?:5, maxItems?:50, timeBudgetMs?:3000, includeNonInteractive?:false, [窗口选择器])`（返回短期 `elementId`）\n- 实时窗口列表：`QueryWindows()`\n\n二、 目标定位与动作执行\n- 智能统合动作(首选，按 UIA→OCR→图生图涂色差分 自动降级)：`Interact(action?:'click'|'invoke'|'setValue'|'type'|'toggle'|'select'|'expand'|'collapse'|'focus', name?, automationId?, controlType?, elementId?, text?, description?, channels?:'uia,ocr,image_edit', verifyText?, textDisappears?, verifyTimeoutMs?:8000, [窗口选择器])`\n- 原生 UIA 动作：`UIAction(action?:'invoke'|'setValue'|'toggle'|'select'|'expand'|'collapse'|'focus', elementId?, name?, automationId?, controlType?, value?, [窗口选择器])`\n- OCR 文本点击：`ClickText(text, matchMode?:'fuzzy'|'contains'|'exact'|'startswith', index?:1, button?:'left', clicks?:1, [窗口选择器])`\n- 视觉涂色点击：`ClickVisual(description, color?:'纯红色(#FF0000)', button?:'left', clicks?:1, [窗口选择器])`\n- 坐标/输入/滚轮：`ClickAt(x, y, relativeToWindow?:false, background?:false, button?:'left', clicks?:1, [窗口选择器])`；`TypeText(text, enter?:false, [窗口选择器])`；`ScrollAt(direction:'up'|'down', amount?:3, x?, y?, [窗口选择器])`\n\n三、 状态同步等待\n- `WaitForText(text, condition?:'appear'|'disappear', matchMode?:'contains'|'exact', timeoutMs?:10000, pollIntervalMs?:200, [窗口选择器])`\n- `WaitForElement(elementId?, name?, automationId?, controlType?, condition?:'appear'|'disappear', timeoutMs?:10000, pollIntervalMs?:200, [窗口选择器])`\n- `WaitForDisappear(text?, ocr?:false, elementId?, name?, automationId?, timeoutMs?:10000, [窗口选择器])`",
+      "scope": "agent",
       "wrap": false,
-      "builtinKey": "loom",
-      "order": 2
+      "builtinKey": "window-control",
+      "order": 5
     },
     {
-      "id": "builtin_scriptorium",
+      "id": "builtin_scriptorium-upstream",
       "name": "文坊权限",
       "type": "system_suffix",
       "enabled": false,
       "content": "—— VCP文坊协同器 (ScriptoriumCollaborator) ——\n通则：统一 tool_name:'ScriptoriumCollaborator'，支持串行批处理(command1, command2...)及显式等待 waitMs(默认1000, 最大30000)。\n写操作须提供 maid 署名；建议显式提供 summary、requestId，重试同一次操作沿用 requestId。数组/对象参数可按工具格式传 JSON。\n\n核心公理：\n1. [长文档原则]：禁无目的读取全文！先 GetOutline，再按临时 id/index 调 GetSection，细节用 SearchSource；源码按行分段读取。\n2. [沙箱隔离]：DOCX 岛必用 <div data-vdoc-island=\"唯一ID\"> + IIFE 闭环且禁污染 window；PPTX 严禁全局 document，必用 scene.querySelector。\n3. [白板协作]：已有白板禁整板覆盖！先 GetBoard，带最新 expectedRevision 提交局部原子变更；尊重用户笔迹，禁擅自删改用户内容。CreateBoard 仅用于新建完整白板。\n4. [审批与文脉]：文稿/演示保持原PR审批策略；白板默认自动允许并保存，人类可在白板文脉面板关闭。Agent不得自行改变审批开关。自动允许仍保留署名、摘要、回执、快照及修订冲突检查。\n5. [回执确权]：applied不等于saved！检查 success、status、saved；pending表示待审，conflict表示未合并。冲突后重新读取，不盲目重试。创建时分别检查 saved 与 opened。\n\n一、感知与多模态视界 (Perception & Inspection)\n- 概要与目录：GetDocumentInfo(endpoint?:'docx'|'pptx'|'common')；GetOutline(endpoint?)。\n- 源码与切片：GetSource(endpoint?, sourceKind?:'markdown-hybrid'|'document-css'|'html'|'deck-css', startLine?, endLine?, slideIndex?)；GetViewportSource(endpoint?, radius?:40)；GetRenderedText(endpoint?, slideIndex?)。\n- 局部章节与检索：GetSection(id?, index?)；SearchSource(query, endpoint?, sourceKind?:'all', regex?:false, caseSensitive?:false)；ListFonts(language?:'zh-CN'|'en'|'all')。\n- 多模态视界：GetVisualContext(endpoint?, scope?:'viewport'|'slide', slideIndex?:1-based, format?:'jpeg'|'png', quality?:1-100, visualDelayMs?:750, ids?:string[], region?:{x,y,width,height})。\n  *文稿支持视口截图，演示支持逐页截图；回执提供摘要+图片。\n  *纯图形白板直接导出内容图片，可用ids/region，不改变用户视野。\n  *含HTML节点的白板改用实际视口截图，不得传ids/region；尚不支持HTML整板合成导出。\n- 白板感知：GetBoard(ids?:string[], region?:{x,y,width,height}, sinceRevision?, limit?:200)。\n  *返回元素摘要、文字(label/text)、箭头拓扑(start/end)、by:'agent'标记及最新revision；HTML节点返回type:'html'、title和sourceLength，不展开源码。\n- HTML节点源码：GetBoardNodeSource(id, startLine?, endLine?)。\n  *返回source、revision、实际行号与总行数；单次最多2000行，大节点分段读取。\n- 白板文脉：GetBoardHistory()。\n  *返回autoAllow及记录摘要、署名、状态、审批回执，不展开历史快照和提案源码；可用于查询待审提案后续结果。\n\n二、文稿与幻灯片变更 (PR Mutations)\n*写操作提供maid署名和summary，建议携带expectedRevision；不得将白板自动允许策略套用于文稿/演示。*\n- DOCX变更：SubmitSourcePr(endpoint:'docx', summary, expectedRevision?, sourceKind?:'markdown-hybrid'|'document-css', append?, insert?:{line,text}, target?:原文本, replace?:新文本, startLine?, replacements?:[])。\n- PPTX增删：AddSlide(summary, source, name?, notes?)；InsertSlide(slideIndex:1-based, summary, source, name?, notes?)；DeleteSlide(summary, slideIndex?:1-based)。\n- 演示配置：UpdatePresentationConfig(summary, width?, height?, aspectRatio?:'16:9', theme?, defaultTransition?:{type,duration})。\n- PR审计：GetPrHistory(limit?:50, status?:'pending'|'applied'|'rejected')。\n\n三、白板创建与图谱编辑 (Board / Excalidraw)\n*白板命令使用common端点，通常省略endpoint；不指定docx/pptx。*\n- 完整创建：CreateBoard(maid, name或title, elements:Element[], background?, requestId?, openAfterCreate?:true)。\n  *创建并保存新.excalidraw文件，重名自动编号；普通元素与HTML节点可同批创建。openAfterCreate=false仅落盘；请求打开仍可能受当前未保存文档的用户确认影响。\n  *返回filePath、saved、opened、elementCount。创建幂等为有界会话缓存，不保证跨进程重试去重。\n- 原子增量变更：UpdateBoard(maid, summary?, requestId?, expectedRevision:必填, save?:true, background?:'#fff9db', add?:Element[], update?:ElementPatch[], delete?:id[])。\n  *默认经文脉自动批准并保存；save=false仅应用不保存。人类关闭自动允许后返回status:'pending'，批准前不改画布。\n  *修改进入撤销栈；回执附crowded(元素重叠/穿字)、loose(孤立无拓扑卡片)诊断。仅在实际应用后检查这些诊断。\n- 显式保存：SaveBoard(expectedRevision:必填)。\n  *保存当前白板及文脉；检查saved，不绕过外部文件冲突。\n- add规范：\n  · 形状：{id,type:'rectangle'|'ellipse'|'diamond',x?,y?,below?:id,right?:id,gap?:100,width?,height?,label?:{text,fontSize:16|22|28}}。\n    缺省宽高按文字自适应；同批同字号卡片可自动等宽。\n  · 文本：{id,type:'text',x,y,text,fontSize?}。\n  · 拓扑箭头：{type:'arrow',start:{id},end:{id},label?:{text},strokeStyle?:'solid'|'dashed'}。\n    自动连接已有或同批卡片；两端悬空时才写x,y,width,height。\n  · HTML节点：{id,type:'html',title?,x?,y?,width?:480,height?:320,source:HTML源码}。\n    宽高80至4096；单节点源码最多512KB。建议显式设置id，便于读取、连线和局部编辑。\n- update规范：\n  · 普通元素：[{id,x?,y?,width?,height?,angle?,text?,label?,strokeColor?,backgroundColor?,fillStyle?,strokeWidth?,strokeStyle?,opacity?,points?...}]。\n    卡片移动时连接箭头跟随；框中文字改label，独立文字改text。\n  · HTML源码整体替换：[{id,source:完整新源码,title?}]。\n  · HTML源码局部替换：[{id,replacements:[{target:唯一原文,replace:新文本}],title?}]。\n    source与replacements互斥；多个替换基于同一原始源码，零命中、多命中或区间重叠均拒绝，不产生部分修改。\n- delete规范：['id1','id2']。\n  *删框时框中文字一并删除，连接箭头保留并自动断开；禁止擅自删除用户内容。\n- 构图原则：因果/先后用箭头，组成/并列用分叉或分区框，对比左右并排，前提/代价用虚线；箭头标明关系，字号分层，一张卡片表达一个意思。\n\n四、HTML节点运行与白板文脉 (Programmable Nodes & Lineage)\n- HTML节点源码可含HTML片段、内联<style>与<script>；脚本建议用IIFE封装。\n  *节点是独立iframe，可使用自身document.querySelector；不要套用PPTX的scene变量，也不要访问parent、top或宿主API。\n- 当前运行能力：内联JavaScript、CSS动画、data资源；禁止网络、外部脚本、任意文件资源、子框架和表单。\n  *尚未接入Anime.js/Three.js等本地依赖通道，不要生成依赖CDN才能运行的节点。\n- 默认鼠标交给画布，用节点“交互”按钮进入操作，用“退出交互”按钮退出；iframe聚焦时不依赖宿主Esc。\n- 源码保存在元素customData中，随白板保存、撤销和恢复；运行DOM、闭包、计时器及动画现场不自动持久化。\n- 白板文脉默认自动允许，人类可手动关闭；Agent无审批策略修改接口。\n  *支持人类手动刻点、审批、拒绝及回溯；回溯前保留当前状态，并新增恢复记录，不删除后续历史。\n  *重开文件时旧pending提案取消，不自动执行；需要重新读取修订并提交。\n  *白板含文脉总大小上限40MB，超限拒绝保存并保留原文件。\n\n五、资产管理与整包工程 (Assets & Lifecycle)\n- 文稿/演示工程落盘：CreateProject(maid, projectType:'docx'|'pptx', title, fileName?, source:docx必填, documentCss?, deckCss?, slides:pptx必填[{source}], conflictPolicy?:'rename'|'error'|'overwrite', expectedFileHash?, openAfterCreate?)；GetStorageInfo()。\n  *覆盖已有工程必须提供expectedFileHash；白板使用CreateBoard，不使用CreateProject。\n- 样式资产：ListStylePacks()；GetStylePack(packId)；UpsertStylePack(maid, pack|source)；DeleteStylePack(maid, packId)。\n- 图形资产：ListSvgAssetPacks()；ListSvgAssets(query?, category?)；GetSvgAsset(assetId)；GetSvgAssetPack(packId)；UpsertSvgAssetPack(maid, pack|source)；DeleteSvgAssetPack(maid, packId)。\n- 白板文件管理：人类UI提供命名新建、保存、另存为、重命名、定位文件与首页“用户白板”分类；当前未提供同名Agent重命名/另存为命令。",
       "scope": "global",
       "wrap": true,
-      "builtinKey": "scriptorium",
-      "order": 3
+      "builtinKey": "scriptorium-upstream",
+      "order": 6
+    },
+    {
+      "id": "builtin_html_media-upstream",
+      "name": "启用HTML多媒体能力",
+      "type": "system_suffix",
+      "enabled": false,
+      "content": "—— 多媒体渲染与程序合成 (MediaRenderer) ——\n通则：所有命令统一 tool_name:'MediaRenderer'。素材URL(file://|http://|data:)直接内嵌，禁止额外包装；支持内置库(Anime.js / Three.js / Pixi.js v8需异步init)。复杂异步动画统一 readyMode:'signal' 且初始化后调 window.__MEDIA_RENDERER__.setReady()。\n\n1. 静态图渲染 (RenderImage)\n   `command:'RenderImage', html|svg, width, height, format?:'png'|'jpg'|'webp', transparent?:false, background?:'#fff', quality?:90, waitMs?:0, fileName?`\n2. 逻辑逐帧动画/视频 (RenderAnimation)\n   `command:'RenderAnimation', html|svg, width, height, format:'gif'|'mp4'|'webm', durationMs?:5000, fps?:30, transparent?:false, audioUrl?:音频URL, readyMode?:'signal', fileName?`\n   *帧驱动铁律：必须注册 `window.__MEDIA_RENDERER__.setFrameRenderer((timeMs, frameIndex, fps) => {...})` 驱动绝对逻辑时间，禁止实时 requestAnimationFrame。*\n3. 鼠标主题包生成 (GenerateCursorTheme)\n   `command:'GenerateCursorTheme', html:完整SVG/HTML, themeName, author, sizes?:'32,48,64', readyMode?:'signal'`\n   *约束：HTML必须包含全部15个核心角色SVG插槽(arrow, help, appstarting, wait, crosshair, text, handwriting, unavailable, vertical, horizontal, diagonal1, diagonal2, move, alternate, link)；动画角色须注册 setRenderer 并注明 data-duration/data-fps。*\n4. 程序化音频算法合成 (GenerateAudio)\n   `command:'GenerateAudio', requireAdmin:用户提供的6位验证码, code:合成JS源码, durationMs?:10000, sampleRate?:44100, tempo?:160, seed?:42, masterVolume?:1, fileName?`\n   *代码规范：源码中声明 `function synthesize(api)`，通过 `api.addNote({...})` 或向 `api.left/right` (Float32Array) 填充采样。*\n",
+      "scope": "global",
+      "wrap": true,
+      "builtinKey": "html-media-upstream",
+      "order": 7
+    },
+    {
+      "id": "builtin_chart",
+      "name": "V图表",
+      "type": "system_suffix",
+      "enabled": false,
+      "content": "—— VCP 图表控制器 (ChartController) ——\n通则：所有命令统一 tool_name:'ChartController'。图表为单例工作台右侧展示。公共参数：chartId:必需。\n安全铁律：库仅限 anime, three, pixi (自动重定向本地)；禁止在 template 塞远程 script/iframe；runtime.js 顶层须 return {mount(context), update(change,context)?, resize?, setTheme?, destroy?}。支持乐观锁 expectedRevision / expectedCodeRevision / expectedDataRevision。\n\n一、 图表生命周期与工作台 (Lifecycle & Workbench)\n- 创建图表：`CreateChart(manifest:JSON|str, template, style, runtime, initialData?, open?:true)`\n  *manifest核心：{id, name, description?, libraries?:[\"anime\"], window?:{width, height}, dataSources?:{}}*\n- 工作台展示：`OpenChart(chartId)`；`CloseChart(chartId)` (仅关闭展示不删数据)\n- 运行态查询：`GetChartRuntimeStatus(chartId)`；`GetChart(chartId)` (获取元信息摘要)\n- 软删与回收：`DeleteChart(chartId, expectedRevision?)` (返回trashId)；`ListDeletedCharts()`；`RestoreChart(trashId)`；`PurgeChart(trashId, confirm:true)` (永久硬删)\n- 图表索引：`ListCharts(query?)`\n\n二、 源码热编辑与回滚 (Code & Sources)\n*file 可选: 'chart.json' | 'template.html' | 'style.css' | 'runtime.js'*\n- 读取源码：`GetChartSource(chartId, file, lines?:'M-N'|'head:N'|'tail:N')`\n- 热更编辑：`EditChartSource(chartId, file, content?:全量替换, target?:精确匹配原句, replace?:新文本, expectedCodeRevision?)`\n- 源码回滚：`RollbackChartSource(chartId, file, targetRevision:目标版本号)`\n\n三、 外置数据原子驱动与数据源 (Data & Sources)\n- 数据读取：`GetChartData(chartId, path?:JSON_Pointer, paths?:[...], tail?:N)`\n- 局部快更：`SetData(chartId, path:JSON_Pointer, value, create?:true, expectedDataRevision?)`\n- 原子批操作：`PatchData / MutateData(chartId, operations:[{op:'add'|'remove'|'replace'|'set'|'append'|'prepend'|'merge'|'increment', path, value, maxItems?}], operationId?:幂等ID, expectedDataRevision?)`\n- 全量重置：`ReplaceData(chartId, data:JSON, expectedDataRevision?)`\n- 只读数据源嗅探：`ReadDataSource(chartId, type:'http-json'|'json'|'csv'|'text'|'sqlite', url?, source?:fileURL/绝对路径, sql?:SELECT语句, params?:[])`\n\n四、 视觉审阅与诊断 (Perception)\n- 渲染观察：`ObserveChart(chartId, mode?:'preview'|'current', width?:800, height?:500, format?:'png'|'jpeg', quality?:90)` (返回多模态截图与布局诊断)\n\n支持通过const直接引用本地json，db数据或者http statusource等等。\n可以在正文使用\n```vcp-chart\nid: cpu-monitor\nheight: 360\ntitle: CPU 实时监控\n```\n引用生成好的图表",
+      "scope": "global",
+      "wrap": false,
+      "builtinKey": "chart",
+      "order": 9
+    },
+    {
+      "id": "builtin_vcp_desktop",
+      "name": "VCP桌面权限",
+      "type": "system_suffix",
+      "enabled": false,
+      "content": "VCP桌面相关\n{{VarDesktop}}\n[[VCP桌面知识日记本::RiverMemo]]",
+      "scope": "agent",
+      "wrap": false,
+      "builtinKey": "vcp-desktop",
+      "order": 10
+    },
+    {
+      "id": "builtin_workspace_tree",
+      "name": "工作区目录感知",
+      "type": "system_suffix",
+      "enabled": false,
+      "content": "当前本地工作区的真实根路径与目录结构如下（不含文件内容，需要时请按“根目录 + 相对路径”读取真实文件）：\n{{VCPChatWorkSpace}}",
+      "scope": "global",
+      "wrap": true,
+      "builtinKey": "workspace-tree",
+      "order": 12
     },
     {
       "id": "builtin_forbid_tools",
@@ -54,18 +120,7 @@
       "scope": "agent",
       "wrap": false,
       "builtinKey": "forbid-tools",
-      "order": 4
-    },
-    {
-      "id": "builtin_vcp_desktop",
-      "name": "VCP桌面权限",
-      "type": "system_suffix",
-      "enabled": false,
-      "content": "VCP桌面相关\n{{VarDesktop}}\n[[VCP桌面知识日记本::TagMemo]]",
-      "scope": "agent",
-      "wrap": false,
-      "builtinKey": "vcp-desktop",
-      "order": 5
+      "order": 13
     },
     {
       "id": "builtin_server_auth_code",
@@ -76,62 +131,18 @@
       "scope": "agent",
       "wrap": false,
       "builtinKey": "server-auth-code",
-      "order": 6
+      "order": 14
     },
     {
-      "id": "builtin_window_control",
-      "name": "窗口控制权限",
+      "id": "builtin_loom",
+      "name": "Loom权限",
       "type": "system_suffix",
       "enabled": false,
-      "content": "—— 窗口感知器 —— \n{{VCPProcessList}}\n—— 屏幕视觉与操控 (ScreenPilot) ——\n通则：所有命令统一 tool_name:'ScreenPilot'，支持串行批处理(command1, windowTitle1...)。\n窗口选择器(任意选一)：`hwnd?:整数, windowTitle?:标题模糊词, processName?:进程名(如'YuanShen.exe')`。\n双轨原则：提供窗口选择器时，点击/输入/滚动支持 `background:true` 后台静默执行(不抢键鼠焦点)。\n\n一、 视觉与状态感知 (Perception)\n- 截图感知：`ScreenCapture(format?:'jpeg'|'png', quality?:85, ocr?:false, save?:false, [窗口选择器])`\n- UI自动化树：`InspectUI(controlType?:'Button'|'Edit', maxDepth?:5, maxItems?:50, [窗口选择器])`\n- 实时窗口查询：`QueryWindows()` (获取最新进程、HWND与标题列表)\n\n二、 定位与动作执行 (Action Primitives)\n- 智能统合动作 (首选)：`Interact(action?:'click'|'invoke'|'setValue'|'type', name?, automationId?, text?, description?, channels?:'uia,ocr,image_edit', verifyText?, textDisappears?, [窗口选择器])`\n- 文本OCR点击：`ClickText(text, matchMode?:'fuzzy'|'exact', index?:1, button?:'left', clicks?:1, [窗口选择器])`\n- 视觉语义点击：`ClickVisual(description, color?:'纯红色(#FF0000)', button?:'left', clicks?:1, [窗口选择器])` (AI局部涂色差分定位)\n- 像素物理点击：`ClickAt(x, y, relativeToWindow?:false, button?:'left', clicks?:1, background?:false, [窗口选择器])`\n- 文本输入：`TypeText(text, enter?:false, [窗口选择器])` (后台WM_CHAR，前台Ctrl+V)\n- 滚轮滚动：`ScrollAt(direction:'up'|'down', amount?:3, x?, y?, [窗口选择器])`\n- 原生UIA模式：`UIAction(action?:'invoke'|'setValue'|'toggle'|'select'|'focus', elementId?, automationId?, value?, [窗口选择器])`\n\n三、 状态同步与等待 (Synchronization)\n- 等待文字：`WaitForText(text, condition?:'appear'|'disappear', matchMode?:'contains'|'exact', timeoutMs?:10000, pollIntervalMs?:200, [窗口选择器])`\n- 等待元素：`WaitForElement(name?, automationId?, controlType?, elementId?, condition?:'appear'|'disappear', timeoutMs?:10000, [窗口选择器])`\n",
-      "scope": "agent",
-      "wrap": false,
-      "builtinKey": "window-control",
-      "order": 7
-    },
-    {
-      "id": "builtin_html_media",
-      "name": "启用HTML多媒体能力",
-      "type": "system_suffix",
-      "enabled": false,
-      "content": "—— 多媒体渲染与程序合成 (MediaRenderer) ——\n通则：所有命令统一 tool_name:'MediaRenderer'。素材URL(file://|http://|data:)直接内嵌，禁止额外包装；支持内置库(Anime.js / Three.js / Pixi.js v8需异步init)。复杂异步动画统一 readyMode:'signal' 且初始化后调 window.__MEDIA_RENDERER__.setReady()。\n\n1. 静态图渲染 (RenderImage)\n   `command:'RenderImage', html|svg, width, height, format?:'png'|'jpg'|'webp', transparent?:false, background?:'#fff', quality?:90, waitMs?:0, fileName?`\n2. 逻辑逐帧动画/视频 (RenderAnimation)\n   `command:'RenderAnimation', html|svg, width, height, format:'gif'|'mp4'|'webm', durationMs?:5000, fps?:30, transparent?:false, audioUrl?:音频URL, readyMode?:'signal', fileName?`\n   *帧驱动铁律：必须注册 `window.__MEDIA_RENDERER__.setFrameRenderer((timeMs, frameIndex, fps) => {...})` 驱动绝对逻辑时间，禁止实时 requestAnimationFrame。*\n3. 鼠标主题包生成 (GenerateCursorTheme)\n   `command:'GenerateCursorTheme', html:完整SVG/HTML, themeName, author, sizes?:'32,48,64', readyMode?:'signal'`\n   *约束：HTML必须包含全部15个核心角色SVG插槽(arrow, help, appstarting, wait, crosshair, text, handwriting, unavailable, vertical, horizontal, diagonal1, diagonal2, move, alternate, link)；动画角色须注册 setRenderer 并注明 data-duration/data-fps。*\n4. 程序化音频算法合成 (GenerateAudio)\n   `command:'GenerateAudio', requireAdmin:用户提供的6位验证码, code:合成JS源码, durationMs?:10000, sampleRate?:44100, tempo?:160, seed?:42, masterVolume?:1, fileName?`\n   *代码规范：源码中声明 `function synthesize(api)`，通过 `api.addNote({...})` 或向 `api.left/right` (Float32Array) 填充采样。*\n",
-      "scope": "global",
-      "wrap": true,
-      "builtinKey": "html-media",
-      "order": 8
-    },
-    {
-      "id": "builtin_workspace_tree",
-      "name": "工作区目录感知",
-      "type": "system_suffix",
-      "enabled": true,
-      "content": "当前本地工作区的真实根路径与目录结构如下（不含文件内容，需要时请按“根目录 + 相对路径”读取真实文件）：\n{{VCPChatWorkSpace}}",
-      "scope": "global",
-      "wrap": true,
-      "builtinKey": "workspace-tree",
-      "order": 9
-    },
-    {
-      "id": "builtin_chart",
-      "name": "V图表",
-      "type": "system_suffix",
-      "enabled": false,
-      "content": "—— VCP 图表控制器 (ChartController) ——\n通则：所有命令统一 tool_name:'ChartController'。图表为单例工作台右侧展示。公共参数：chartId:必需。\n安全铁律：库仅限 anime, three, pixi (自动重定向本地)；禁止在 template 塞远程 script/iframe；runtime.js 顶层须 return {mount(context), update(change,context)?, resize?, setTheme?, destroy?}。支持乐观锁 expectedRevision / expectedCodeRevision / expectedDataRevision。\n\n一、 图表生命周期与工作台 (Lifecycle & Workbench)\n- 创建图表：`CreateChart(manifest:JSON|str, template, style, runtime, initialData?, open?:true)`\n  *manifest核心：{id, name, description?, libraries?:[\"anime\"], window?:{width, height}, dataSources?:{}}*\n- 工作台展示：`OpenChart(chartId)`；`CloseChart(chartId)` (仅关闭展示不删数据)\n- 运行态查询：`GetChartRuntimeStatus(chartId)`；`GetChart(chartId)` (获取元信息摘要)\n- 软删与回收：`DeleteChart(chartId, expectedRevision?)` (返回trashId)；`ListDeletedCharts()`；`RestoreChart(trashId)`；`PurgeChart(trashId, confirm:true)` (永久硬删)\n- 图表索引：`ListCharts(query?)`\n\n二、 源码热编辑与回滚 (Code & Sources)\n*file 可选: 'chart.json' | 'template.html' | 'style.css' | 'runtime.js'*\n- 读取源码：`GetChartSource(chartId, file, lines?:'M-N'|'head:N'|'tail:N')`\n- 热更编辑：`EditChartSource(chartId, file, content?:全量替换, target?:精确匹配原句, replace?:新文本, expectedCodeRevision?)`\n- 源码回滚：`RollbackChartSource(chartId, file, targetRevision:目标版本号)`\n\n三、 外置数据原子驱动与数据源 (Data & Sources)\n- 数据读取：`GetChartData(chartId, path?:JSON_Pointer, paths?:[...], tail?:N)`\n- 局部快更：`SetData(chartId, path:JSON_Pointer, value, create?:true, expectedDataRevision?)`\n- 原子批操作：`PatchData / MutateData(chartId, operations:[{op:'add'|'remove'|'replace'|'set'|'append'|'prepend'|'merge'|'increment', path, value, maxItems?}], operationId?:幂等ID, expectedDataRevision?)`\n- 全量重置：`ReplaceData(chartId, data:JSON, expectedDataRevision?)`\n- 只读数据源嗅探：`ReadDataSource(chartId, type:'http-json'|'json'|'csv'|'text'|'sqlite', url?, source?:fileURL/绝对路径, sql?:SELECT语句, params?:[])`\n\n四、 视觉审阅与诊断 (Perception)\n- 渲染观察：`ObserveChart(chartId, mode?:'preview'|'current', width?:800, height?:500, format?:'png'|'jpeg', quality?:90)` (返回多模态截图与布局诊断)\n\n支持通过const直接引用本地json，db数据或者http statusource等等。\n可以在正文使用\n```vcp-chart\nid: cpu-monitor\nheight: 360\ntitle: CPU 实时监控\n```\n引用生成好的图表",
+      "content": "—— VCP Loom Agent 控制器 (LoomController) ——\n通则：所有命令统一 tool_name:'LoomController'。侧栏浏览器固定 appId:'vcpchat-browser' 且须带 targetId；LoomAPP 使用其注册的 appId。支持编号串行批处理(command1/target1/text1, command2/waitMs2...)。\n\n一、 官方侧栏浏览器 (Browser & Human-in-the-loop)\n- 启动/标签：`OpenVCPChatBrowser(url)` (返回appId与targetId)；`list_tabs()`；`switch_tab(targetId)`；`close_tab(targetId?)`；`open_url(url)`\n- 人工接管：`RequestBrowserAssistance(targetId, message:求助原因)` (遇验证码/登录时挂起等待，严禁并发写操作)\n\n二、 页面感知与多模态 (Perception)\n*动作前必须先通过快照获取 target 元素句柄*\n- 核心快照：`GetPageInfo(appId, targetId?)` (获取Grounded Markdown、DOM元素句柄与documentGeneration)\n- 文本/源码：`GetRenderedText(appId, targetId?, refresh?:true)`；`GetRuntimeSource(appId, targetId?)`\n- 多模态截取：`GetPageImage(appId, imageId:'IMG1'|'vcp-img-*', targetId?, format?:'jpeg', quality?:85)`\n\n三、 页面原子交互与高级动作 (Actions)\n*公共可选校验参数：snapshotId?, strict?, runtimeInstanceId?*\n- 点击/输入：`click(appId, target, targetId?)`；`type(appId, target, text, targetId?)`；`set_value(appId, target, value)`\n- 键盘/悬停：`send_keys(appId, keys:'Enter'|'Ctrl+A', target?, targetId?)`；`hover(appId, target)`；`check(appId, target, checked?:true)`\n- 下拉/滚动：`select_option(appId, target, value?|text?|index?)`；`scroll(appId, direction:'down'|'up'|'bottom'|'top', amount?, target?)`\n- 智能等待：`wait_for(appId, condition:'dom_stable'|'element'|'visible'|'text', target?, stableMs?:800, timeoutMs?)`\n- 通用动作/CDP：`ExecuteAction(appId, actionId, params?:{}, options?:{})`\n\n四、 LoomAPP 容器管理 (App Lifecycle)\n- 应用状态：`ListApps()`；`ListOpenApps()`；`OpenApp(appId)`；`CloseApp(appId)`；`ReloadPage(appId)`；`NavigateBack/Forward/Home(appId)`\n- 源码管理：`GetAppSources(appId)`\n- 应用创建：`CreateApp(manifest:JSON, css?:string, js?:string)`\n  *manifest核心：{id, name, startUrl, enabled:true, window:{width, height}, viewport, request:{profile:'mobile'|'desktop'}, iconSource?:{type:'canvas'|'svg', ...}}*\n- 运行时编辑：`EditAppSources(appId, manifest?:JSON, css?:string, js?:string)` (支持热更新)\n\n五、 Skill 持久化技能引擎 (Skill Engine)\n- 创建编译：`CreateSkill(skillId, appId, title, description?, placeholders:{\"var\":{\"description\", \"required\":true}}, validationMode?:'current'|'trial'|'none', command1, target1, text1:{{var}}...)`\n- 技能运维：`ManageSkill(operation:'list'|'get'|'delete', skillId?)`；`EditSkill(skillId, ...)`\n- 执行派发：`ExecuteSkill(skillId, inputs:JSON, mode?:'sync'|'async')` (长任务选async并由GetSkillTask查询)；`GetSkillTask(taskId)`\n",
       "scope": "global",
       "wrap": false,
-      "order": 10,
-      "builtinKey": "chart"
-    },
-    {
-      "id": "builtin_project_forge",
-      "name": "V工程",
-      "type": "system_suffix",
-      "enabled": false,
-      "content": "# V工程协作与代码施工（ProjectForge）\n\n用于创建工程、管理待办、调查代码、修改文件及追踪回退。工具名：`ProjectForge`。标准 VCP 调用格式见置顶，署名使用自己的 `maid` 或 `valet`；调查及施工推荐 `ink=mark_history`。\n\n下文 `命令(参数)` 为速查：命令填入 `command`，参数分别作为字段；`?` 表示可选。不要按函数语法调用。\n\n## 1. 操作入口\n\n- 文件路径相对**工程根**；`workspace` 是已登记工作区别名，`dir` 是工作区内子目录。\n- 先查现有工程；创建后使用返回的真实 `projectId`。\n- 已知文件或符号直接读取，不必先全仓库搜索。\n- 同文件多处修改优先一次批处理，不并发独立写入。\n- ProjectForge 负责工程调查、编辑及历史；测试、构建、Git 使用对应 CLI 工具。\n\n常用流程：\n\n```text\nListProjects / CreateProject → GetProject\n→ ReadCode / FindSymbol / Outline / Trace\n→ EditCode / CreateFile / MoveCode\n→ 检查差分、运行相关测试 → SubmitReport\n```\n\n按任务跳过不需要的步骤。\n\n## 2. 工程与待办\n\n```text\nListWorkspaces()\nListProjects(workspace?, query?, includeDeleted?)\nCreateProject(name, workspace?, dir?, todos?)\nGetProject(projectId, timeline?)\nUpdateTodos(projectId, add?, done?, doing?, pending?, blocked?,\n            remove?, seq?, title?, note?)\nSubmitReport(projectId, conclusion, issues?, status?)\n```\n\n- `ListWorkspaces` 查询工作区别名及真实路径。\n- `ListProjects` 可按工作区或关键词筛选；`includeDeleted=true` 包含软删工程。\n- `todos/add` 用换行或逗号分隔。\n- 待办状态及移除字段使用序号列表，如 `1,3`；`seq + title/note` 修改指定项。\n- `GetProject` 查看待办、改动、开发脉络和报告；`timeline` 默认 8。\n- 报告 `status=review|accepted|active`，默认 review；提交报告不等于已经验收。\n\n## 3. 读取、符号与链路调查\n\n```text\nReadCode(projectId, path?|paths?|glob?, lines?, showLine?, find?,\n         symbol?, range?, context?, pick?, line?)\nOutline(projectId, path?|paths?, depth?, kind?)\nFindSymbol(projectId, name, kind?, glob?, exact?, limit?, scope?)\nTrace(projectId, target, scope?, glob?)\n```\n\n### ReadCode：读取源码与资产\n\n```text\npath=src/a.js\npath=src/a.js:40-80\npath=src/a.js#Store.putBlob\n```\n\n也可使用 `path + symbol`。\n\n- `paths`：换行或逗号分隔多个文件；`glob`：批量选择。\n- `lines=head:N|tail:N|M-N|N`；默认带行号，`showLine=false` 关闭。\n- `find` 按字面量查找（同 EditCode target 规则，忽略行首尾空白），返回匹配行、所在函数及上下文；多个关键词写 `a|b` 取并集，`\\|` 匹配字面竖线，`||` 始终按字面量，多行查询不拆分。\n- 符号默认包含紧邻注释/装饰器；`range=body` 从签名开始；`context` 扩展上下文。\n- 同名候选用 `pick` 或近似 `line` 消歧。\n- 支持 JS/TS/TSX/Python/Rust 符号读取；资产支持多模态及文档提取。\n\n### Outline / FindSymbol\n\n- Outline 查看符号层级和行范围。\n- FindSymbol 按 AST 定位定义；`exact=true` 精确或限定名后缀匹配。\n- `limit` 默认 20，最大 500。\n- 返回的 `文件#限定名` 可用于后续读取、编辑。\n- `scope=workspace` 扩大符号搜索；工程外结果只读。\n\n### Trace\n\n`target` 格式：\n\n```text\nipc:通道\napi:preloadAPI\nglobal:名称\npage:页面.html\nfile:相对路径\n```\n\n调查处理端、调用端、声明、页面加载顺序及依赖。`scope=workspace` 扩大范围，`glob` 限定文件。动态调用可能不生成确定边，未发现静态关系不等于不存在运行时调用。\n\n## 4. 编辑代码\n\n```text\nEditCode(projectId, path, reason, 编辑字段,\n         todo?, mode?, revertOnSyntaxError?)\n```\n\n| 操作 | 编辑字段 |\n|---|---|\n| 文本替换 | `target, replace` |\n| 替换行 | `start, end, content` 或 `lines, content` |\n| 插入 | `op=insert, after=N|end` 或 `before=N`，配合 `content` |\n| 删除行 | `op=delete, start, end` |\n| 替换符号 | `path=文件#符号, content` 或 `path + symbol + content` |\n| 删除符号 | `op=delete, symbol` |\n| 符号前后插入 | `op=insert, before=symbol:名称` 或 `after=symbol:名称`，配合 `content` |\n\n- `reason` 说明修改原因；`todo` 关联待办。\n- `after=0` 插入文件开头。\n- `expect` 校验原文，允许在 ±20 行内定位校正。\n- 首尾锚定：`target` 写首行、独立一行 `...`、尾行；支持 `N | 原文` 行号前缀。空 `replace` 删除匹配区间。\n- 符号编辑默认包含前置注释；`range=body` 保留注释。\n- `mode=atomic` 默认全部成功才写；`bestEffort` 跳过失败步骤。\n- `revertOnSyntaxError=true` 阻止引入语法错误，不代替编译或测试。\n\n### 同文件多步编辑\n\n使用数字后缀：\n\n```text\ntarget1, replace1\nop2, start2, end2, content2\nsymbol3, content3\n```\n\n`projectId/path` 共用；可提供 `reasonN`。**所有步骤均基于编辑前快照，行号不计算偏移，重叠区间报错。**\n\n### 多处匹配消歧\n\n多处匹配时不会直接写入；读取候选后调用：\n\n```text\nResolveEdit(ticketId, pick)\n```\n\n- 单步 `pick=2`、`1,3` 或 `all`。\n- 多步 `pick=2:1;5:3`，表示“步骤:候选”。\n- 票据有效 30 分钟；文件变化可能返回新候选。\n\n## 5. 文件与代码块\n\n### 文件操作\n\n```text\nCreateFile(projectId, path, content, reason,\n           overwrite?, todo?, revertOnSyntaxError?)\nRemoveFile(projectId, path?|paths?, reason)\nMoveFile(projectId, from, to, reason)\n```\n\n- CreateFile 自动创建父目录；同名默认拒绝，`overwrite=true` 先存快照再覆盖。\n- RemoveFile 先存快照，再移入回收站。\n- MoveFile 用于移动或重命名；目标存在则拒绝。\n- 此处 MoveFile 使用 `from/to`，不是 FileOperator 的 `sourcePath/destinationPath`。\n\n### 移动或复制代码块\n\n```text\nMoveCode / CopyCode\n  projectId, from, reason, to?,\n  lines?|start/end?|target?|symbol?,\n  expect?, range?, pick?, line?,\n  after?|before?, indent?, todo?, revertOnSyntaxError?\n```\n\n- 源块：`from=文件:M-N`、`from=文件#符号`，或另传对应定位字段。\n- `to` 省略表示同文件；目标文件不存在则新建。\n- 目标位置：`after=N|end`、`before=N` 或 `symbol:名称` 锚点。\n- 默认包含前置注释；`range=body` 除外。\n- `indent=auto|keep|N|+N|-N`。\n- 同文件移动使用操作前行号；跨文件变更归同一批次。\n- CopyCode 复制代码块，不是整文件复制。\n\n### 6. 函数试跑\n\nEvalSymbol(projectId, path, args?, kwargs?, setup?, timeoutMs?,\n           symbol?, pick?, line?, package?, features?, target?, testPick?)\n\n- path=文件#符号；复用 AST 定位，pick/line 消歧。\n- JS/CJS/ESM：调用真实导出函数/对象方法，保留 this。\n- Python：按包导入；kwargs 为关键字参数对象。\n- Rust：仅运行已有标准 #[test]；package/features 限定构建，target/testPick 消歧执行目标。零命中、ignored 不算通过。\n- args 为 JSON 数组，默认 []；setup 为对应语言的异步准备函数体，返回参数数组，与 args 互斥；不支持 Rust setup。\n- timeoutMs：JS/Py 默认 5000，Rust 默认 100000，上限 110000。\n- returned=函数成功返回，不等于测试通过；passed=实际测试通过。失败按阶段返回，details 含 typed-v1 值、运行时、目标源码 hash 与有界日志。\n- 工程根 .projectforge-eval.json 可指定 node/python/cargo；Python 按配置→.venv→PATH 选择，失败不换环境。\n- 仅限可信、可写工程；不是安全沙箱，加载与执行可能产生副作用。TS、局部闭包、自动构造实例及 Rust 临时 harness 不支持。\n\n\n## 7. 历史、差分与回退\n\n```text\nSearchHistory(projectId?, file?, keyword?, content?, byMaid?,\n              todo?, op?, batch?, since?, until?, limit?)\nGetNodeDiff(projectId, node?|batch?, maxLines?)\nRollback(projectId, batch?|toNode?, path?, dryRun?, force?, reason?)\n```\n\n- 历史 `op=create|edit|delete|move|rollback|external`。\n- 操作者筛选字段仍叫 `byMaid`，即使使用 valet 署名也不改字段名。\n- Diff 选择 `node` 或 `batch`。\n- Rollback 选择 `batch` 或 `toNode`；`batch=last` 撤销最近批次，`toNode + path` 恢复单文件。\n- `dryRun=true` 预演；冲突默认拒绝。\n- `force=true` 覆盖冲突前保存当前快照，使用前确认覆盖范围。\n\n## 8. 工程记录清理\n\n```text\nDeleteProjects(projectIds)\nRestoreProjects(projectIds)\nPurgeProjects(projectIds, confirm=true)\n```\n\n`projectIds` 用逗号或换行分隔。\n\n- Delete/Restore 只软删或恢复工程数据库记录，不改磁盘文件。\n- Purge 仅处理已软删工程，永久清除记录及历史快照，不删除磁盘文件；清除后不能通过这些快照回退。",
-      "scope": "global",
-      "wrap": true,
-      "order": 11,
-      "builtinKey": "project-forge"
+      "builtinKey": "loom",
+      "order": 15
     },
     {
       "id": "builtin_fate_divination",
@@ -141,19 +152,8 @@
       "content": "—— 命运与物理魔法 (SuperDice & TarotDivination) ——\n\n1. 3D 物理掷骰 (SuperDice)\n   `SuperDice` — `command:'roll', notation, theme?:'gemstone'|'rock'|'rust'|'smooth'|'wooden'|'diceOfRolling', themecolor?:'#RRGGBB', magic?:'normal'|'moon'|'storm'|'lead'|'bounce', physics?:{gravity, mass, friction...}`\n   *核心：notation 必填(如'1d20'或'2d6+1d20')；themecolor 仅对纯色/宝石/岩石/光滑生效；非必要无需精调 physics。*\nphysics支持gravity(0.15-2.5)、mass(0.25-6)、friction(0.05-1)、restitution(0-0.95)、linearDamping(0.05-0.9)、angularDamping(0.05-0.9)、spinForce(1-18)、throwForce(1-10)、startingHeight(3-14)、settleTimeout(2500-10000)\n\n2. 宇宙塔罗与星象占卜 (TarotDivination)\n   `TarotDivination` — `command:'draw_single_card'|'draw_three_card_spread'|'draw_celtic_cross'|'get_celestial_data', fate_check_number?:number, origin?:'日'|'月'|'星'`\n   *因果铁律：fate_check_number 由占卜师/对方抉择；origin 仰望星空决策命运(低概率触发特殊偶遇)；get_celestial_data 获取实时天文。*\n   *牌桌规范：回执后必须在气泡内用 `<div class=\"tarot-table\">` 构建专属牌桌，内嵌带 3D 翻牌动效（CSS perspective/transform）的卡牌实体。*\n\n★ 联动调用范式：先调 `SuperDice` 投掷 1d100 检定，将其物理点数作为 `fate_check_number` 注入 `TarotDivination`，实现从刚体物理到宇宙因果律的绝对确权！\n",
       "scope": "global",
       "wrap": false,
-      "order": 12,
-      "builtinKey": "fate-divination"
-    },
-    {
-      "id": "builtin_topic_sponsor",
-      "name": "多话题交互",
-      "type": "system_suffix",
-      "enabled": false,
-      "content": "—— TopicSponsor多话题交互能力——\n工具名：TopicSponsor\n  // 一、服务发现与路由寻址 (自主私信前置)\n  ListAgents()                                             // 只读列出全量注册 Agent (name/id/type)\n  ListGroups()                                             // 只读列出全量群聊 (name/id/type)\n  ListRecentTopics(query, target_type?:'agent'|'group')    // 查最新5个话题取topic_id；query传ID或名称(支持模糊匹配)\n\n  // 二、话题创生与心流派发\n  CreateTopic(topic_name, initial_message, maid?)\n  CreateFlowlockTopic(topic_name, initial_message, maid?, flowlock_heartbeat?:number, flowlock_prompt?)\n\n  // 三、感知与状态嗅探\n  ListUnlockedTopics(maid)\n  ReadUnlockedTopics(maid, include_read?:boolean)          // include_read 默认 false（仅未读）\n  CheckNewTopics(maid, days?:number)                      // days 默认 3\n  CheckUnreadMessages(maid)\n  CheckTopicOwnership(topic_id, caller_name, maid?)\n\n  // 四、跨域留言与内容审阅\n  ReadTopicContent(topic_id, maid?)                       // 读取指定话题完整历史流\n  ReplyToTopic(topic_id, message, sender_name|sender_id, source_topic_id?)",
-      "scope": "global",
-      "wrap": false,
-      "order": 13,
-      "builtinKey": "topic-sponsor"
+      "builtinKey": "fate-divination",
+      "order": 19
     }
   ]
 }

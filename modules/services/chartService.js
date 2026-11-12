@@ -49,8 +49,22 @@ function createError(message, code, details = {}) {
     return error;
 }
 
-function normalizeChartId(value) {
-    const chartId = String(value || '').trim().toLowerCase();
+// 模型生成的 runtime 常把根元素写成 context.container，或在 context 上直接调用
+// querySelector。运行时契约只有 context.root，这里在读取快照时做窄范围兼容，
+// 避免图表因这类写法整体不可用（只影响运行，不改写磁盘上的源码）。
+const RUNTIME_CONTEXT_ALIASES = Object.freeze([
+    [/\b(ctx|context)\.container\b/g, '$1.root'],
+    [/\b(ctx|context)\.(querySelector(?:All)?)\s*\(/g, '$1.root.$2('],
+]);
+
+function normalizeRuntimeForMount(source) {
+    return RUNTIME_CONTEXT_ALIASES.reduce(
+        (text, [pattern, replacement]) => text.replace(pattern, replacement),
+        String(source || '')
+    );
+}
+
+function normalizeChartId(value) {    const chartId = String(value || '').trim().toLowerCase();
     if (!CHART_ID_PATTERN.test(chartId)) {
         throw createError(
             'chartId 必须为 2-64 位小写字母、数字、短横线或下划线，并以字母或数字开头。',
@@ -496,7 +510,13 @@ class ChartService extends EventEmitter {
             fs.readFile(path.join(dir, SOURCE_FILES.runtime), 'utf8'),
             fs.readFile(path.join(dir, SOURCE_FILES.data), 'utf8'),
         ]);
-        return { manifest, template, style, runtime, data: JSON.parse(data) };
+        return {
+            manifest,
+            template,
+            style,
+            runtime: normalizeRuntimeForMount(runtime),
+            data: JSON.parse(data),
+        };
     }
 
     async listCharts(options = {}) {

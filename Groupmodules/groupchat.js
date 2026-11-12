@@ -217,7 +217,7 @@ function buildGroupRequestBody(messagesForAI, modelConfig, messageId) {
         messageId
     };
     if (vcpchatExtensions) {
-        requestBody.vcpchatExtensions = vcpchatExtensions;
+        requestBody.vcpchatExtensions = { ...modelConfig.vcpchatExtensions, ...vcpchatExtensions };
     }
     return requestBody;
 }
@@ -259,7 +259,21 @@ async function readLatestGroupHistory(groupId, topicId) {
     return getGroupChatHistory(groupId, topicId);
 }
 
+function normalizeHistoryMessageContent(message) {
+    const content = message?.content;
+    if (content != null && typeof content === 'object' && !Array.isArray(content)) {
+        // 旧版群聊（含历史上的多端同步）会把文本包成 { text } 落盘；CDS 同步
+        // 只接受字符串 content，因此在统一写入入口收敛为 .text 字符串。
+        if (typeof content.text === 'string') {
+            message.content = content.text;
+        } else {
+            message.content = '';
+        }
+    }
+}
+
 async function appendGroupHistoryMessage(groupId, topicId, message) {
+    normalizeHistoryMessageContent(message);
     if (groupHistoryMutationQueue) {
         const result = await groupHistoryMutationQueue.mutate(
             getGroupHistoryDescriptor(groupId, topicId),
@@ -1397,6 +1411,7 @@ ${canvasData.errors || 'No errors'}
                     },
                     body: JSON.stringify(buildGroupRequestBody(messagesForAI, {
                         model: modelConfigForAgent.model,
+                        ...(agentConfig.reasoningSelection ? { vcpchatExtensions: { reasoning: structuredClone(agentConfig.reasoningSelection) } } : {}),
                         temperature: modelConfigForAgent.temperature,
                         stream: modelConfigForAgent.stream
                     }, messageIdForAgentResponse)),
@@ -2107,6 +2122,7 @@ ${canvasData.errors || 'No errors'}
                 },
                 body: JSON.stringify(buildGroupRequestBody(messagesForAI, {
                     model: modelConfigForAgent.model,
+                    ...(agentConfig.reasoningSelection ? { vcpchatExtensions: { reasoning: structuredClone(agentConfig.reasoningSelection) } } : {}),
                     temperature: modelConfigForAgent.temperature,
                     stream: modelConfigForAgent.stream,
                     max_tokens: modelConfigForAgent.max_tokens

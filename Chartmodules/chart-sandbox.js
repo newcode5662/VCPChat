@@ -478,6 +478,8 @@
         });
         return Object.freeze({
             root,
+            // 兼容早期/模型生成的 runtime 中常用的 container 写法。
+            container: root,
             manifest,
             libraries,
             resources,

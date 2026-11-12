@@ -314,6 +314,7 @@ export function setupEventListeners(deps) {
             const useStreaming = (agentConfig?.streamOutput !== false);
             const modelConfigForVCP = {
                 model: agentConfig?.model || 'gemini-pro',
+                ...(agentConfig?.reasoningSelection ? { reasoningSelection: structuredClone(agentConfig.reasoningSelection) } : {}),
                 temperature: agentConfig?.temperature !== undefined ? parseFloat(agentConfig.temperature) : 0.7,
                 ...(agentConfig?.maxOutputTokens && { max_tokens: parseInt(agentConfig.maxOutputTokens) }),
                 ...(agentConfig?.contextTokenLimit && { contextTokenLimit: parseInt(agentConfig.contextTokenLimit) }),

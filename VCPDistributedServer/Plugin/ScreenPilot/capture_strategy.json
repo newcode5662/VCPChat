@@ -13,5 +13,15 @@
     "method": "dxgi",
     "learned_at": "2026-10-04 10:02:04",
     "reason": "GDI 截到黑屏，DXGI 成功"
+  },
+  "electron.exe": {
+    "method": "gdi",
+    "learned_at": "2026-11-02 20:47:35",
+    "reason": "GDI 截图正常"
+  },
+  "cajviewer.exe": {
+    "method": "gdi",
+    "learned_at": "2026-11-02 20:49:23",
+    "reason": "GDI 截图正常"
   }
 }

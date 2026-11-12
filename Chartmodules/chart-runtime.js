@@ -327,6 +327,8 @@
             });
             return Object.freeze({
                 root: this.host,
+                // 兼容早期/模型生成的 runtime 中常用的 container 写法。
+                container: this.host,
                 manifest: this.snapshot.manifest,
                 libraries: Object.freeze({
                     anime: window.anime,
