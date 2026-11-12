@@ -156,6 +156,8 @@
                     </div>
                     <div class="reader-tools">
                         <button id="outline-toggle" class="btn small active" type="button" aria-pressed="true">大纲</button>
+                        <button id="inspect-region-toggle" class="btn small" type="button" aria-expanded="false">原页核验</button>
+                        <button id="review-document-toggle" class="btn small" type="button" aria-expanded="false">全篇校正草稿</button>
                         <div class="md-find">
                             <input id="md-find-input" type="search" placeholder="在正文中查找" autocomplete="off" spellcheck="false">
                             <span id="md-find-count" class="find-count" hidden></span>
@@ -164,6 +166,42 @@
                         </div>
                     </div>
                 </div>
+                <section id="inspect-region-panel" class="inspection-panel" hidden aria-label="原PDF区域核验">
+                    <div class="inspection-controls">
+                        <strong>原页核验（只读）</strong>
+                        <label>页码 <input id="inspect-page" type="number" min="1" value="1"></label>
+                        <label>裁框 <input id="inspect-bbox" type="text" placeholder="[x0,y0,x1,y1]，留空整页"></label>
+                        <button id="inspect-current" class="btn small" type="button">取当前页码</button>
+                        <button id="inspect-run" class="btn small primary" type="button">核验</button>
+                        <button id="inspect-cancel" class="btn small" type="button" disabled>取消等待</button>
+                    </div>
+                    <p class="hint">裁框使用未旋转 PDF 页面 point 坐标，不是屏幕像素。需配置 MINERU_PYTHON 及新后端。结果仅为证据，不自动修改正文。</p>
+                    <div id="inspect-status" role="status" aria-live="polite"></div>
+                    <div class="inspection-result">
+                        <img id="inspect-image" hidden alt="原PDF核验区域">
+                        <pre id="inspect-text"></pre>
+                    </div>
+                </section>
+                <section id="review-document-panel" class="inspection-panel" hidden aria-label="全篇校正草稿">
+                    <div class="inspection-controls">
+                        <strong>全篇核验与校正草稿</strong>
+                        <button id="review-document-start" class="btn small primary" type="button">逐页核验并生成草稿</button>
+                        <button id="review-document-cancel" class="btn small" type="button" disabled>停止后续页</button>
+                    </div>
+                    <p class="hint">原文保持不变。当前自动规则仅覆盖有 PDF 词级证据的 Unicode 连字展开；化学式、数值、断词、公式和双栏顺序仍需复核。最多200页，取消后等待当前页退出。</p>
+                    <div id="review-document-status" role="status" aria-live="polite"></div>
+                    <div id="review-document-proposals" aria-label="逐项复核候选"></div>
+                    <button id="review-document-compose" class="btn small" type="button" disabled>生成所选校正版预览</button>
+                    <button id="review-document-export" class="btn small" type="button" disabled>导出所选校正版与报告（不含图片）</button>
+                    <details>
+                        <summary>差异与未解决项</summary>
+                        <pre id="review-document-diff"></pre>
+                    </details>
+                    <details>
+                        <summary>独立校正版草稿（未保存）</summary>
+                        <textarea id="review-document-markdown" readonly aria-label="校正版Markdown草稿" rows="12"></textarea>
+                    </details>
+                </section>
                 <div id="reader-body" class="reader-body" data-view="split">
                     <aside id="outline-pane" class="outline-pane" aria-label="论文大纲">
                         <div class="outline-head">大纲</div>

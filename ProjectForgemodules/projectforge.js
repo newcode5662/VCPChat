@@ -311,7 +311,43 @@ function renderTimeline() {
         $('pane-timeline').innerHTML = '<p class="muted">暂无改动</p>';
         return;
     }
-    $('pane-timeline').innerHTML = `<div class="timeline">${timeline.map(b => `
+    $('pane-timeline').innerHTML = `<div class="timeline">${timelineCards(timeline)}</div>${timelineMoreButton()}`;
+}
+
+function timelineMoreButton() {
+    return state.detail.timelineHasMore
+        ? '<button class="btn" type="button" data-timeline-more>加载更早 100 批</button>'
+        : '<p class="muted">已显示全部施工脉络</p>';
+}
+
+async function loadMoreTimeline(button) {
+    if (button.disabled) return;
+    const detail = state.detail;
+    const projectId = state.currentId;
+    button.disabled = true;
+    button.textContent = '加载中…';
+    try {
+        const page = await call(api.projectForgeGetTimeline(projectId, {
+            beforeBatch: detail.timelineBeforeBatch, limit: 100,
+        }));
+        if (state.detail !== detail || state.currentId !== projectId) return;
+        const known = new Set(detail.timeline.map(b => b.id));
+        const added = page.timeline.filter(b => !known.has(b.id));
+        $('pane-timeline').querySelector('.timeline').insertAdjacentHTML('beforeend', timelineCards(added));
+        detail.timeline.push(...added);
+        detail.timelineHasMore = page.timelineHasMore;
+        detail.timelineBeforeBatch = page.timelineBeforeBatch;
+        button.outerHTML = timelineMoreButton();
+    } catch (error) {
+        if (state.detail === detail && state.currentId === projectId) toast(`读取更早脉络失败：${error.message}`, 'error');
+    } finally {
+        button.disabled = false;
+        button.textContent = '加载更早 100 批';
+    }
+}
+
+function timelineCards(timeline) {
+    return timeline.map(b => `
         <div class="tl-item kind-${escapeHtml(b.kind)}" data-batch="${b.id}">
             <div class="tl-card">
                 <div class="tl-head">
@@ -325,7 +361,7 @@ function renderTimeline() {
                 <div class="muted" style="font-size:12px;margin-top:4px">${b.files.slice(0, 6).map(f => `<code>${escapeHtml(f)}</code>`).join('、')}${b.files.length > 6 ? ` 等 ${b.files.length} 个` : ''}</div>
                 <div class="tl-nodes"></div>
             </div>
-        </div>`).join('')}</div>`;
+        </div>`).join('');
 }
 
 function nodeRowHtml(n) {
@@ -369,9 +405,12 @@ function renderFiles() {
 
 function renderReport() {
     const { project } = state.detail;
-    $('pane-report').innerHTML = project.report
-        ? `<div class="muted" style="margin-bottom:10px">提交者 ${maidHtml(project.report_by)} · 状态 ${statusBadge(project)}</div><div class="markdown">${renderMarkdownSafe(project.report)}</div>`
-        : '<p class="muted">尚未提交验收报告。</p>';
+    $('pane-report').innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px">
+            <div class="muted">${project.report ? `提交者 ${maidHtml(project.report_by)} · ` : ''}状态 ${statusBadge(project)}</div>
+            <button class="btn" type="button" data-export-report="${escapeHtml(project.id)}" style="flex-shrink:0" title="导出完整工程履历，含起点、全部施工脉络与存档验收报告">📄 导出报告</button>
+        </div>
+        ${project.report ? `<div class="markdown">${renderMarkdownSafe(project.report)}</div>` : '<p class="muted">尚未提交验收报告。</p>'}`;
 }
 
 // ============================ 历史搜索 ============================
@@ -651,6 +690,26 @@ function bindEvents() {
     $('project-search').addEventListener('input', debounce(renderProjectList, 120));
     $('include-deleted').addEventListener('change', loadProjects);
 
+    let exportingReport = false;
+    $('pane-report').addEventListener('click', async e => {
+        const button = e.target.closest('[data-export-report]');
+        if (!button || exportingReport) return;
+        const projectId = button.dataset.exportReport;
+        exportingReport = true;
+        button.disabled = true;
+        button.textContent = '导出中…';
+        try {
+            const result = await call(api.projectForgeExportReport(projectId));
+            if (!result.canceled) toast(`报告已导出：${result.filePath}`, 'success');
+        } catch (error) {
+            toast(`导出失败：${error.message}`, 'error');
+        } finally {
+            exportingReport = false;
+            button.disabled = false;
+            button.textContent = '📄 导出报告';
+        }
+    });
+
     let activeAcceptButton = null;
     let acceptTimer = null;
     const accepting = new Set();
@@ -774,6 +833,8 @@ function bindEvents() {
     });
 
     $('pane-timeline').addEventListener('click', e => {
+        const more = e.target.closest('[data-timeline-more]');
+        if (more) { loadMoreTimeline(more); return; }
         const row = e.target.closest('.node-row');
         if (row) { openNode(row.dataset.node); return; }
         const head = e.target.closest('.tl-head, .tl-reason');

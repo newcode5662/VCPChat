@@ -1,6 +1,10 @@
 // MinerUmodules/mineru.js
 // MinerU 论文工作台：论文库、导入查重、解析队列、全库重复检索与双栏阅读。
 import { createMinerUReader } from './mineru-reader.js';
+import { createRegionInspector } from './region-inspector.js';
+import { createDocumentReview } from './document-review.js';
+let regionInspector = null;
+let documentReview = null;
 
 const api = window.utilityAPI || window.electronAPI;
 const $ = id => document.getElementById(id);
@@ -492,6 +496,8 @@ async function selectPaper(paperId, { reload = false } = {}) {
         setTab('library');
         return;
     }
+    regionInspector?.reset();
+    documentReview?.reset();
     state.currentId = paperId;
     state.detail = null;
     setTab('library');
@@ -1534,6 +1540,14 @@ async function init() {
         onImageOpen: openLightbox,
     });
 
+    regionInspector = createRegionInspector({
+        api, root: document,
+        getPaperId: () => state.currentId,
+        getPage: () => reader?.pdfPage || 1,
+    });
+    documentReview = createDocumentReview({
+        api, root: document, getPaperId: () => state.currentId,
+    });
     bindEvents();
     await initTheme();
     setView(state.view, { persist: false });
@@ -1572,7 +1586,11 @@ async function init() {
     api.onMineruJob?.(job => upsertJob(job, { notify: true }));
     api.onMineruLibraryChanged?.(() => scheduleLibraryReload());
     api.windowReady?.('mineru-workbench');
-    window.addEventListener('beforeunload', () => reader?.destroy());
+    window.addEventListener('beforeunload', () => {
+        regionInspector?.destroy();
+        documentReview?.destroy();
+        reader?.destroy();
+    });
 }
 
 document.addEventListener('DOMContentLoaded', () => { void init(); });

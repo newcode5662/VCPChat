@@ -65,6 +65,8 @@ minerUHandlers.registerScheme(protocol);
 // 文坊中原位打开的网页（scriptorium-page:// 协议），须在 app ready 之前登记。
 const scriptoriumPages = require('./modules/scriptorium/webPages');
 protocol.registerSchemesAsPrivileged([scriptoriumPages.PRIVILEGE]);
+const minerUHandlers = require('./modules/ipc/minerUHandlers'); // MinerU 论文工作台
+minerUHandlers.registerScheme(protocol);
 
 // 不再对整个应用关闭 Chromium 的后台节流（background-timer-throttling / renderer-backgrounding /
 // backgrounding-occluded-windows）和挂起监视器：那组开关让所有窗口、所有 <webview> 和 GPU 进程在后台
@@ -333,7 +335,9 @@ const NATIVE_SPLASH_READY_FILE = app.isPackaged
 const AGENT_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'Agents');
 const USER_DATA_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'UserData'); // For chat histories and attachments
 const SETTINGS_FILE = path.join(APP_DATA_ROOT_IN_PROJECT, 'settings.json');
-const TERMINAL_EXECUTOR_PATH = path.join(PROJECT_ROOT, 'VCPDistributedServer', 'Plugin', 'PowerShellExecutor', 'PowerShellExecutor.js');
+// 诊断只观察缓存，不加载执行器；Windows 与非 Windows 的后端都必须计入。
+const TERMINAL_EXECUTOR_PATHS = ['PowerShellExecutor', 'PTYShellExecutor'].map(name =>
+    path.join(PROJECT_ROOT, 'VCPDistributedServer', 'Plugin', name, `${name}.js`));
 const USER_AVATAR_FILE = path.join(USER_DATA_DIR, 'user_avatar.png'); // Standardized user avatar file
 const MUSIC_PLAYLIST_FILE = path.join(APP_DATA_ROOT_IN_PROJECT, 'songlist.json');
 const MUSIC_COVER_CACHE_DIR = path.join(APP_DATA_ROOT_IN_PROJECT, 'MusicCoverCache');
@@ -355,6 +359,8 @@ let distributedServer = null; // To hold the distributed server instance
 let distributedServerStartPromise = null;
 let chatDataService = null; // Optional VCP-CDS shadow service.
 let historyMutationQueue = null;
+let topicAdmissionHost = null;
+let topicConversationResolver = null;
 let pluginAgentOperationService = null;
 let chartService = null;
 let gameService = null;
@@ -771,6 +777,9 @@ async function performQuitCleanup() {
         }
 
         workspaceHandlers.dispose();
+        await topicAdmissionHost?.dispose?.();
+        topicAdmissionHost = null;
+        topicConversationResolver = null;
         await historyMutationQueue?.dispose?.();
         historyMutationQueue = null;
         pluginAgentOperationService = null;
@@ -883,7 +892,7 @@ function createWindow({ deferLoad = false } = {}) {
 
     // 当主窗口关闭时的处理逻辑：
     // 1. macOS 上始终隐藏而非关闭
-    // 2. 当桌面窗口存在时，隐藏到托盘而非退出（偷天换日！）
+    // 2. Windows/Linux：只要还有其它窗口（桌面窗口等）让进程继续活着，就隐藏到托盘而非销毁
     // 3. 其他情况正常退出
     mainWindow.on('close', (event) => {
         if (app.isQuitting) {
@@ -898,12 +907,16 @@ function createWindow({ deferLoad = false } = {}) {
             return;
         }
 
-        // Windows/Linux：如果桌面窗口存在，隐藏到托盘
-        const dw = desktopHandlers.getDesktopWindow();
-        if (dw && !dw.isDestroyed()) {
+        // Windows/Linux：销毁主窗口后进程仍可能被其它窗口留住，
+        // 而主窗口绑定的服务（内嵌应用会话等）不会随重建的窗口重新初始化，
+        // 所以有其它窗口存活时改为隐藏到托盘。
+        const otherWindows = BrowserWindow.getAllWindows()
+            .filter(window => window !== mainWindow && !window.isDestroyed());
+        if (otherWindows.length > 0) {
             event.preventDefault();
             mainWindow.hide();
-            console.log('[Main] Desktop window active — main window hidden to tray instead of closing.');
+            console.log(`[Main] ${otherWindows.length} other window(s) alive — main window hidden to tray instead of closing.`);
+            return;
         }
         // 否则允许正常关闭（触发 closed 事件）
     });
@@ -1188,12 +1201,9 @@ if (!gotTheLock) {
             return;
         }
 
-        const ragObserverWindow = ragHandlers.getRagObserverWindow();
-        if (ragObserverWindow && !ragObserverWindow.isDestroyed()) {
-            if (ragObserverWindow.isMinimized()) ragObserverWindow.restore();
-            if (!ragObserverWindow.isVisible()) ragObserverWindow.show();
-            ragObserverWindow.focus();
-        }
+        // 主窗口已销毁但进程还活着（桌面窗口等其它窗口存活时应用不会退出）：
+        // 重建主窗口，否则 start.bat 只会触发第二实例后闪退，没有任何窗口出现。
+        createWindow();
     });
 
 
@@ -1263,7 +1273,29 @@ if (!gotTheLock) {
             fileWatcher,
             logger: console
         });
+        const { createTopicConversationResolver } = require('./modules/services/topicConversationResolver');
+        const { createTopicMessageAdmissionHost } = require('./modules/services/topicMessageAdmissionHost');
+        topicConversationResolver = createTopicConversationResolver({
+            agentDir: AGENT_DIR,
+            groupDir: path.join(APP_DATA_ROOT_IN_PROJECT, 'AgentGroups'),
+            userDataDir: USER_DATA_DIR,
+        });
+        topicAdmissionHost = await createTopicMessageAdmissionHost({
+            appDataRoot: APP_DATA_ROOT_IN_PROJECT,
+            historyQueue: historyMutationQueue,
+            validate: scope => topicConversationResolver.validate(scope),
+            getMainWindow: () => mainWindow,
+            advanceGroup: request => groupChatHandlers.advanceTopicAdmission(request),
+            ipcMain,
+        });
+        const { createTopicSponsorDelivery } = require('./modules/services/topicSponsorDelivery');
+        const topicDelivery = createTopicSponsorDelivery({
+            admission: topicAdmissionHost.service,
+            resolver: topicConversationResolver,
+            findAgent: query => pluginAgentOperationService.findAgent(query),
+        });
         pluginAgentOperationService = new PluginAgentOperationService({
+            topicDelivery,
             agentDir: AGENT_DIR,
             userDataDir: USER_DATA_DIR,
             agentConfigManager,
@@ -1689,7 +1721,8 @@ if (!gotTheLock) {
             stopSelectionListener: assistantHandlers.stopSelectionListener,
             startSelectionListener: assistantHandlers.startSelectionListener,
             settingsManager: appSettingsManager,
-            agentConfigManager
+            agentConfigManager,
+            historyMutationQueue
         });
 
         await assistantHandlers.initialize({ SETTINGS_FILE });
@@ -1714,6 +1747,7 @@ if (!gotTheLock) {
             startSelectionListener: assistantHandlers.startSelectionListener,
             fileWatcher, // Inject fileWatcher here as well
             historyMutationQueue,
+            topicAdmission: topicAdmissionHost.service,
             jevService: globalJevService,
             gameService
         });
@@ -1812,6 +1846,12 @@ if (!gotTheLock) {
             net: require('electron').net,
         });
         scriptoriumPages.installProtocol();
+        minerUHandlers.initialize({
+            appDataRoot: APP_DATA_ROOT_IN_PROJECT,
+            projectRoot: PROJECT_ROOT,
+            protocol,
+            net: require('electron').net,
+        });
         chartService = await chartHandlers.initialize({
             projectRoot: PROJECT_ROOT,
             appDataRoot: APP_DATA_ROOT_IN_PROJECT,
@@ -1921,7 +1961,7 @@ if (!gotTheLock) {
                 launch: launchMarks.snapshot(),
                 // 终端执行器是否已在主进程加载：侧栏终端第一次用到才 require；分布式服务器开着时它的插件加载也会拉起它
                 terminalExecutor: {
-                    loaded: Boolean(originalRequire.cache[TERMINAL_EXECUTOR_PATH]),
+                    loaded: TERMINAL_EXECUTOR_PATHS.some(executorPath => Boolean(originalRequire.cache[executorPath])),
                     distributedServer: Boolean(distributedServer),
                 },
             };

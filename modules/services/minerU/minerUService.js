@@ -300,7 +300,11 @@ function runCommand(request, { timeoutMs = COMMAND_TIMEOUT_MS, onChild = null } 
         }
         onChild?.(child);
 
-        let stdout = '';
+        const stdoutChunks = [];
+        let stdoutBytes = 0;
+        const maxStdoutBytes = request.command === 'inspect_pdf_region'
+            ? 16 * 1024 * 1024 : 8 * 1024 * 1024;
+        let outputLimitExceeded = false;
         let stderr = '';
         let timedOut = false;
         let settled = false;
@@ -318,8 +322,18 @@ function runCommand(request, { timeoutMs = COMMAND_TIMEOUT_MS, onChild = null } 
             : null;
 
         child.stdout.on('data', data => {
-            stdout += data.toString('utf8');
-            if (stdout.length > 8 * 1024 * 1024) stdout = stdout.slice(-4 * 1024 * 1024);
+            if (outputLimitExceeded) return;
+            const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
+            stdoutBytes += chunk.length;
+            if (stdoutBytes > maxStdoutBytes) {
+                outputLimitExceeded = true;
+                stdoutChunks.length = 0;
+                // Drain remaining output without retaining it. The existing timeout
+                // still supervises exit; do not orphan the Python child by killing
+                // only its Rust parent here.
+                return;
+            }
+            stdoutChunks.push(chunk);
         });
         child.stderr.on('data', data => {
             stderr += data.toString('utf8');
@@ -337,13 +351,23 @@ function runCommand(request, { timeoutMs = COMMAND_TIMEOUT_MS, onChild = null } 
             settled = true;
             if (timer) clearTimeout(timer);
             if (killTimer) clearTimeout(killTimer);
-            const parsed = parseStdout(stdout);
-            if (parsed?.status === 'success') {
+            if (outputLimitExceeded || timedOut) {
+                resolve({
+                    ok: false,
+                    error: outputLimitExceeded ? 'MINERU_OUTPUT_LIMIT：响应超过上限，未返回裁剪数据。'
+                        : 'MINERU_TIMEOUT：命令已超时。',
+                    timedOut,
+                });
+                return;
+            }
+            const parsed = parseStdout(Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8'));
+            if (code === 0 && parsed?.status === 'success') {
                 const content = Array.isArray(parsed.result?.content) ? parsed.result.content : [];
                 const text = content.map(part => part?.text || '').filter(Boolean).join('\n');
                 resolve({
                     ok: true,
                     data: parsed.result?.data ?? null,
+                    content,
                     text,
                     stderr: stderr.trim(),
                 });
@@ -742,6 +766,50 @@ function resolveImagePath(paperId, relative) {
     return realTarget;
 }
 
+const documentReview = require('./documentReviewJobs').createDocumentReviewJobs({
+    readSource(paperId) {
+        const detail = getPaperDetail(requirePaperId(paperId));
+        return {
+            scope: toolboxRoot, pdfPath: detail.pdfPath,
+            markdown: detail.markdown,
+        };
+    },
+    inspect: (paperId, options) => inspectPdfRegion(paperId, options),
+    notify: (owner, job) => events.emit('document-review', { owner, job }),
+});
+
+function startDocumentReview(owner, paperId) {
+    return documentReview.start(owner, requirePaperId(paperId));
+}
+function getDocumentReview(owner, jobId) { return documentReview.get(owner, jobId); }
+function getDocumentReviewResult(owner, jobId) { return documentReview.result(owner, jobId); }
+function composeDocumentReview(owner, jobId, selected) {
+    return documentReview.compose(owner, jobId, selected);
+}
+function exportDocumentReview(owner, jobId, selected, directory) {
+    const selection = documentReview.compose(owner, jobId, selected);
+    return require('./reviewExport').exportReviewBundle(directory, selection);
+}
+function cancelDocumentReview(owner, jobId) { return documentReview.cancel(owner, jobId); }
+function closeDocumentReviewOwner(owner) { documentReview.cancelOwner(owner); }
+async function inspectPdfRegion(paperId, options = {}) {
+    const id = requirePaperId(paperId);
+    const root = toolboxRoot;
+    const seq = libraryRefreshSeq;
+    const record = getRecord(id);
+    const { makeRequest, validateResult } = require('./regionInspection');
+    const request = makeRequest(record, options);
+    const result = await commandRunner(request, { timeoutMs: 70000 });
+    if (root !== toolboxRoot || seq !== libraryRefreshSeq) {
+        throw new Error('PDF_REGION_SUPERSEDED：库环境已刷新，请重新核验。');
+    }
+    const current = getRecord(id);
+    if (!current || current.pdfPath !== record.pdfPath
+        || current.pdfBindingStatus === 'disabled') {
+        throw new Error('PDF_REGION_SUPERSEDED：PDF关联已改变。');
+    }
+    return validateResult(result, request);
+}
 function readPdf(paperId) {
     const record = getRecord(paperId);
     if (!record) throw new Error(`未找到论文 ${paperId}。`);
@@ -1434,6 +1502,14 @@ module.exports = {
     getRecord,
     getPaperDetail,
     fetchPaperDetail,
+    inspectPdfRegion,
+    startDocumentReview,
+    getDocumentReview,
+    getDocumentReviewResult,
+    composeDocumentReview,
+    exportDocumentReview,
+    cancelDocumentReview,
+    closeDocumentReviewOwner,
     readPdf,
     setPdfMapping,
     clearPdfMapping,

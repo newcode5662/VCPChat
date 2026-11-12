@@ -20,6 +20,13 @@ const CHANNELS = [
     'mineru:scan',
     'mineru:get-paper',
     'mineru:read-pdf',
+    'mineru:inspect-region',
+    'mineru:review-start',
+    'mineru:review-status',
+    'mineru:review-result',
+    'mineru:review-compose',
+    'mineru:review-export',
+    'mineru:review-cancel',
     'mineru:pick-pdfs',
     'mineru:pick-folder',
     'mineru:pick-pdf-for-paper',
@@ -40,6 +47,7 @@ const CHANNELS = [
 let ipc = defaultIpcMain;
 let initialized = false;
 let disposers = [];
+const reviewOwners = new Map();
 const isAllowedSender = createApplicationSenderGuard({ pages: PAGES });
 
 function senderWindow(event) {
@@ -115,6 +123,37 @@ function registerChannels() {
     handle('mineru:scan', () => service.refreshLibrary());
     handle('mineru:get-paper', (_event, paperId) => service.fetchPaperDetail(paperId));
     handle('mineru:read-pdf', (_event, paperId) => service.readPdf(paperId));
+    handle('mineru:inspect-region', (_event, paperId, options) =>
+        service.inspectPdfRegion(paperId, options));
+    handle('mineru:review-start', (event, paperId) => {
+        const sender = event.sender;
+        if (!reviewOwners.has(sender.id)) {
+            reviewOwners.set(sender.id, sender);
+            sender.once('destroyed', () => {
+                service.closeDocumentReviewOwner(sender.id);
+                reviewOwners.delete(sender.id);
+            });
+        }
+        return service.startDocumentReview(sender.id, paperId);
+    });
+    handle('mineru:review-status', (event, jobId) => service.getDocumentReview(event.sender.id, jobId));
+    handle('mineru:review-result', (event, jobId) => service.getDocumentReviewResult(event.sender.id, jobId));
+    handle('mineru:review-compose', (event, jobId, selected) =>
+        service.composeDocumentReview(event.sender.id, jobId, selected));
+    handle('mineru:review-export', async (event, jobId, selected) => {
+        service.composeDocumentReview(event.sender.id, jobId, selected);
+        const selection = [...selected];
+        const result = await dialog.showOpenDialog(senderWindow(event) || undefined, {
+            title: '导出校正版与差异报告（新建独立目录，不含图片副本）',
+            properties: ['openDirectory', 'createDirectory'],
+        });
+        if (result.canceled || !result.filePaths[0]) return { cancelled: true };
+        if (event.sender.isDestroyed() || !isAllowedSender(event)) {
+            throw new Error('PDF_REVIEW_OWNER_UNAVAILABLE');
+        }
+        return service.exportDocumentReview(event.sender.id, jobId, selection, result.filePaths[0]);
+    });
+    handle('mineru:review-cancel', (event, jobId) => service.cancelDocumentReview(event.sender.id, jobId));
 
     handle('mineru:pick-pdfs', event => pickPdfFiles(event));
     handle('mineru:pick-folder', event => pickFolder(event));
@@ -188,6 +227,10 @@ function initialize(options = {}) {
     protocolService.install(options);
     registerChannels();
     disposers = [
+        service.on('document-review', ({ owner, job }) => {
+            const sender = reviewOwners.get(owner);
+            if (sender && !sender.isDestroyed()) sender.send('mineru:review-progress', job);
+        }),
         service.on('job', payload => sendToWorkbench('mineru:job', payload)),
         service.on('jobs-changed', payload => sendToWorkbench('mineru:jobs-changed', payload)),
         service.on('job-recovery-warning', payload => sendToWorkbench('mineru:recovery-warning', payload)),

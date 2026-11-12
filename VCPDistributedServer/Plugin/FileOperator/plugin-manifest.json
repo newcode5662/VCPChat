@@ -50,7 +50,15 @@
     "invocationCommands": [
       {
         "command": "ListAllowedDirectories",
-        "description": "功能: 列出此插件被授权访问的所有根目录及其第一层子目录和文件。这是探索可用文件系统的安全入口点。\n参数: 无。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ListAllowedDirectories「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "列出客户端授权访问的所有根目录及其首层内容（无参数）。\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ListAllowedDirectories「末」\n<<<[END_TOOL_REQUEST]>>>"
+      },
+      {
+        "command": "QueryOperation",
+        "description": "查询客户端显式写操作账本（不执行写入，位于 AppData/FileOperatorOperations/v1/client）。参数：operationId(必需)。返回 details.operation.record：missing、prepared、committed 或 retired；prepared 待核对时严禁盲目重试追加。幂等写仅在 WriteFile/AppendFile/EditFile 提供 operationId（1-128位 [A-Za-z0-9][A-Za-z0-9._-]*）时启用；可选 expectedRevision（SHA256 或 'missing'）及 WriteFile 的 conflictPolicy='rename'(默认)|'error'|'overwrite'；批处理支持 operationId1...。"
+      },
+      {
+        "command": "CleanupOperation",
+        "description": "显式清理客户端已提交操作的详细账本（保留 retired 标记，不删目标文件；prepared 禁止清理）。参数：operationId(必需)、expectedFingerprint(取自 QueryOperation 的 requestFingerprint)、confirm:true。"
       },
       {
         "command": "QueryOperation",
@@ -62,76 +70,76 @@
       },
       {
         "command": "ReadFile",
-        "description": "功能: 读取指定绝对路径下文件的内容。特别优化了对多种格式的支持：对于 .pdf, .docx, .xlsx, .xls, .csv 等文件，插件会自动解析并提取其纯文本内容返回给AI；对于其他文件类型，则按普通文本文件读取。支持可选 lines 参数按行读取文本内容。\n参数:\n- filePath (字符串, 必需): 要读取的文件的绝对路径。\n- encoding (字符串, 可选, 默认'utf8'): 对于普通文本文件，可以指定编码格式 (例如: 'utf8', 'ascii')。对于自动解析的文件，此参数无效。\n- lines (字符串, 可选): 仅对文本内容生效的行范围读取语法，行号按1起算。支持 head:N 读取开头N行；tail:N 读取末尾N行；M-N 或 M:N 读取第M到N行；N 读取单独第N行。对图片、音频、视频等 data: 内容会跳过并在返回结果中说明。返回 details 中会包含 lines 元数据（请求范围、实际范围、总行数、选中行数）。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ReadFile「末」,\nfilePath:「始」/path/to/your/document.pdf「末」,\nlines:「始」head:50「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "读取客户端绝对路径文件（自动提取 .pdf/.docx/.xlsx/.xls/.csv 纯文本；支持多模态图片/音视频）。参数：filePath(必需), lines?('head:N'|'tail:N'|'M-N'|'M:N'|'N', 1-based), encoding?:'utf8'。\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ReadFile「末」,\nfilePath:「始」D:\\vcp\\VCPChat\\README.md「末」,\nlines:「始」head:50「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
       {
         "command": "WebReadFile",
-        "description": "功能: 从一个URL地址读取文件。插件会先将文件下载到本地一个临时文件夹内，然后复用ReadFile的逻辑进行解析和内容提取，支持所有ReadFile支持的格式（如PDF, DOCX, 图片等），并同步支持 ReadFile 的 lines 行范围读取语法。成功后，会返回文件内容以及一个本地文件URL。\n参数:\n- url (字符串, 必需): 要读取的文件的完整URL地址 (支持http和https)。\n- lines (字符串, 可选): 仅对下载后的文本内容生效的行范围读取语法，行号按1起算。支持 head:N、tail:N、M-N、M:N、N。对图片、音频、视频等 data: 内容会跳过并在返回结果中说明。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」WebReadFile「末」,\nurl:「始」http://example.com/sample.txt「末」,\nlines:「始」1-20「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "下载 HTTP(S) 文件至临时目录并按 ReadFile 规则解析文本或多模态内容。参数：url(必需), lines?。\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」WebReadFile「末」,\nurl:「始」https://example.com/sample.txt「末」,\nlines:「始」1-20「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
       {
         "command": "WriteFile",
-        "description": "功能: 将内容写入指定文件。如果目标路径已存在同名文件，它不会覆盖，而是自动在文件名后添加序号来创建新文件（例如，将 'file.txt' 创建为 'file(1).txt'），并会在返回结果中告知AI新的文件名。这确保了不会意外丢失数据。\n参数:\n- filePath (字符串, 必需): 要写入的文件的绝对路径。\n- content (字符串, 必需): 要写入文件的内容，支持多行。\n- encoding (字符串, 可选, 默认'utf8'): 写入时使用的文件编码。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」WriteFile「末」,\nfilePath:「始」/path/to/your/file.txt「末」,\ncontent:「始」这是要写入的新内容。\n这是第二行。\n「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "写入新文件（默认同名自动加序号如 file(1).txt 防覆盖；带 operationId 时可用 conflictPolicy 控制）。参数：filePath(必需), content(必需), encoding?:'utf8', operationId?, expectedRevision?, conflictPolicy?。\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」WriteFile「末」,\nfilePath:「始」D:\\vcp\\VCPChat\\AppData\\Notemodules\\note.md「末」,\ncontent:「始」第一行\n第二行「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
       {
         "command": "AppendFile",
-        "description": "功能: 将内容追加到指定文件的末尾。如果文件不存在，则会创建新文件。\n参数:\n- filePath (字符串, 必需): 要追加内容的文件的绝对路径。\n- content (字符串, 必需): 要追加的内容。\n- encoding (字符串, 可选, 默认'utf8'): 追加时使用的文件编码。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」AppendFile「末」,\nfilePath:「始」/path/to/your/log.txt「末」,\ncontent:「始」\n--- 新的日志条目 ---\n「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "向文件末尾追加内容（不存在则新建）。参数：filePath(必需), content(必需), encoding?:'utf8', operationId?, expectedRevision?。"
       },
       {
         "command": "EditFile",
-        "description": "功能: 编辑一个已存在的文件，用新内容完全覆盖旧内容。这是一个精确的覆写操作。如果文件不存在，此命令会返回错误，而不是创建新文件。若要创建文件，请使用'WriteFile'。\n参数:\n- filePath (字符串, 必需): 要编辑的文件的绝对路径。\n- content (字符串, 必需): 要写入的全新内容。\n- encoding (字符串, 可选, 默认'utf8'): 写入时使用的文件编码。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」EditFile「末」,\nfilePath:「始」/path/to/existing_file.txt「末」,\ncontent:「始」这是覆盖后的新内容。\n「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "全量覆写已存在文件（不存在则报错）。参数：filePath(必需), content(必需), encoding?:'utf8', operationId?, expectedRevision?。"
       },
       {
         "command": "ListDirectory",
-        "description": "功能: 列出指定目录的内容，返回文件和子目录列表。\n参数:\n- directoryPath (字符串, 必需): 要列出内容的目录的绝对路径。\n- showHidden (布尔值, 可选, 默认false): 是否显示隐藏文件 (以.开头的文件)。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ListDirectory「末」,\ndirectoryPath:「始」/path/to/directory「末」,\nshowHidden:「始」false「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "列出指定绝对路径目录中的文件与子目录。参数：directoryPath(必需), showHidden?:false。"
       },
       {
         "command": "FileInfo",
-        "description": "功能: 获取指定文件或目录的详细信息（如大小、创建时间、修改时间、是否是目录等）。\n参数:\n- filePath (字符串, 必需): 要获取信息的文件或目录的绝对路径。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」FileInfo「末」,\nfilePath:「始」/path/to/your/file.txt「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "获取文件或目录的大小、时间戳与类型元数据。参数：filePath(必需)。"
       },
       {
         "command": "CopyFile",
-        "description": "功能: 将一个文件从源路径复制到目标路径。如果目标路径已存在同名文件，它会自动在文件名后添加序号来创建新文件（例如，将 'file.txt' 复制为 'file(1).txt'），确保不会覆盖现有文件。\n参数:\n- sourcePath (字符串, 必需): 源文件的绝对路径。\n- destinationPath (字符串, 必需): 目标文件的绝对路径。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」CopyFile「末」,\nsourcePath:「始」/path/to/source.txt「末」,\ndestinationPath:「始」/path/to/destination.txt「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "复制文件（目标同名自动加序号防覆盖）。参数：sourcePath(必需), destinationPath(必需)。"
       },
       {
         "command": "MoveFile",
-        "description": "功能: 将一个文件或目录从一个位置移动到另一个位置。如果目标路径已存在同名文件，它会自动在文件名后添加序号来完成移动（例如，移动 'file.txt' 时，如果目标文件夹已有 'file.txt'，则会将其重命名为 'file(1).txt'）。如果只是想在当前目录安全地重命名文件，建议使用'RenameFile'。\n参数:\n- sourcePath (字符串, 必需): 源文件或目录的绝对路径。\n- destinationPath (字符串, 必需): 目标路径的绝对路径。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」MoveFile「末」,\nsourcePath:「始」/path/to/source.txt「末」,\ndestinationPath:「始」/path/to/new_directory/source.txt「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "移动文件或目录（目标同名自动加序号）。参数：sourcePath(必需), destinationPath(必需)。"
       },
       {
         "command": "RenameFile",
-        "description": "功能: 安全地重命名一个文件。在执行重命名之前，它会检查目标文件名是否已存在。如果已存在，操作将失败并返回错误，从而防止意外覆盖文件。\n参数:\n- sourcePath (字符串, 必需): 要重命名的文件的绝对路径。\n- destinationPath (字符串, 必需): 新的文件名的绝对路径。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」RenameFile「末」,\nsourcePath:「始」/path/to/old_name.txt「末」,\ndestinationPath:「始」/path/to/new_name.txt「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "安全重命名文件（目标已存在则报错拒绝）。参数：sourcePath(必需), destinationPath(必需)。"
       },
       {
         "command": "DeleteFile",
-        "description": "功能: 删除一个文件或一个空目录。对于非空目录，请谨慎使用。\n参数:\n- filePath (字符串, 必需): 要删除的文件或目录的绝对路径。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DeleteFile「末」,\nfilePath:「始」/path/to/deletable_file.txt「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "删除指定文件或空目录。参数：filePath(必需)。"
       },
       {
         "command": "CreateDirectory",
-        "description": "功能: 创建一个新目录。如果父目录不存在，会一并创建。\n参数:\n- directoryPath (字符串, 必需): 要创建的新目录的绝对路径。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」CreateDirectory「末」,\ndirectoryPath:「始」/path/to/new_folder/sub_folder「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "递归创建目录。参数：directoryPath(必需)。"
       },
       {
         "command": "SearchFiles",
-        "description": "功能: 在指定目录中递归搜索匹配特定模式的文件或目录。\n参数:\n- searchPath (字符串, 必需): 要搜索的起始目录的绝对路径。\n- pattern (字符串, 必需): 要搜索的文件模式，支持通配符 (例如: '*.txt', 'image_*.png')。\n- options (JSON字符串, 可选): 包含搜索选项的JSON对象字符串。支持的键包括:\n  - \"caseSensitive\" (布尔值, 默认false): 搜索是否区分大小写。\n  - \"includeHidden\" (布尔值, 默认false): 是否在搜索中包含隐藏文件。\n  - \"fileType\" (字符串, 默认'all'): 搜索的项目类型，可选值为 'file', 'directory', 'all'。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」SearchFiles「末」,\nsearchPath:「始」/path/to/search「末」,\npattern:「始」*.log「末」,\noptions:「始」{\"caseSensitive\": false, \"fileType\": \"file\"}「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "在目录中递归按通配符搜索文件/目录。参数：searchPath(必需), pattern(必需, 如 '*.txt'), options?:JSON字符串({caseSensitive?:false, includeHidden?:false, fileType?:'all'|'file'|'directory'})。"
       },
       {
         "command": "DownloadFile",
-        "description": "功能: (异步) 从一个URL地址下载文件到指定目录中，并可自定义保存的文件名。插件默认会自动从URL中解析文件名，但你也可以通过fileName参数指定一个自定义的文件名。这是一个异步操作，命令会立即返回，告知AI下载已在后台开始以及文件的最终保存路径，AI无需等待下载完成。如果目标路径已存在同名文件，会自动重命名以防止覆盖。\n参数:\n- url (字符串, 必需): 要下载的文件的完整URL地址 (支持http和https)。\n- downloadDir (字符串, 可选): 指定下载目录的绝对路径。如果不提供，将使用.env配置中的DEFAULT_DOWNLOAD_DIR，若未配置则默认为AppData/file目录。\n- fileName (字符串, 可选): 指定保存的文件名（含扩展名，例如 'my_document.pdf'）。如果不提供，将自动从URL路径中解析文件名。\n调用格式（指定目录和文件名）:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」,\ndownloadDir:「始」/path/to/custom/download/folder「末」,\nfileName:「始」my_custom_name.zip「末」\n<<<[END_TOOL_REQUEST]>>>\n或仅指定目录（文件名从URL自动解析）:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」,\ndownloadDir:「始」/path/to/custom/download/folder「末」\n<<<[END_TOOL_REQUEST]>>>\n或使用默认目录和自动文件名:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」DownloadFile「末」,\nurl:「始」http://example.com/archive.zip「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "异步下载 URL 文件至客户端目录（同名自动加序号）。参数：url(必需), downloadDir?(默认 AppData/file), fileName?。"
       },
       {
         "command": "ApplyDiff",
-        "description": "功能: 对指定文件应用一个精确的差异(diff)修改，仅替换 target 首次出现的位置，并保留文件原有换行风格。\n参数:\n- filePath (字符串, 必需): 要修改文件的绝对路径。\n- target (字符串, 必需): 要在文件中查找的精确原文，参数名大小写不敏感。\n- replace (字符串, 必需): 用于替换 target 的新内容，参数名大小写不敏感。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ApplyDiff「末」,\nfilePath:「始」H:\\MCP\\VCPChat\\AppData\\canvas\\nova_cool_doc.md「末」,\ntarget:「始」nova的温度好酷哦！还有html样式哦！看到我的评论了吗？「末」,\nreplace:「始」nova的文档好酷哦！还有html样式哦！看到我的评论了吗？「末」\n<<<[END_TOOL_REQUEST]>>>"
+        "description": "对文件执行精确首次匹配替换（保留原换行风格；支持 command1/filePath1... 批处理）。参数：filePath(必需), target(必需), replace(必需)。\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」ApplyDiff「末」,\nfilePath:「始」D:\\vcp\\VCPChat\\AppData\\canvas\\doc.md「末」,\ntarget:「始」旧文本片段「末」,\nreplace:「始」新文本片段「末」\n<<<[END_TOOL_REQUEST]>>>"
       },
-     {
-       "command": "UpdateHistory",
-       "description": "功能: 安全地更新一个JSON格式的聊天历史文件。此命令专门用于修改AI自己（role: 'assistant'）的发言内容。它会读取文件，解析JSON，查找并替换指定的文本字符串（仅限第一次出现），然后将更新后的内容写回文件，确保JSON结构的完整性。\n参数:\n- filePath (字符串, 必需): 聊天历史JSON文件的绝对路径。\n- target (字符串, 必需): 要在AI发言内容中查找的精确文本，参数名大小写不敏感。\n- replace (字符串, 必需): 用于替换 target 的新内容，参数名大小写不敏感。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」UpdateHistory「末」,\nfilePath:「始」H:\\path\\to\\your\\history.json「末」,\ntarget:「始」这是我想修改的旧内容。「末」,\nreplace:「始」这是替换后的新内容。「末」\n<<<[END_TOOL_REQUEST]>>>"
-     },
-     {
-       "command": "CreateCanvas",
-       "description": "功能: 在指定的Canvas目录中创建一个新文件，并通知主程序打开Canvas窗口来显示这个新文件。这是一个集成功能，结合了文件创建和UI交互。\n参数:\n- fileName (字符串, 必需): 要创建的文件的名称，包含扩展名 (例如 'my_script.js')。\n- content (字符串, 必需): 要写入新文件的初始内容。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」CreateCanvas「末」,\nfileName:「始」new_canvas.js「末」,\ncontent:「始」console.log('Hello, Canvas!');「末」\n<<<[END_TOOL_REQUEST]>>>"
-     },
-     {
-       "command": "EditCanvas",
-       "description": "功能: 向当前已打开的 Canvas 活跃文档提交一次精确的 target/replace 编辑提案。无需也不允许输入文件路径。提案通过 IPC 显示差异供用户审阅，本次工具调用会等待用户明确允许或拒绝；只有允许后才写入文件，拒绝时文件保持不变。target 必须与提交时活跃文档中的一处原文精确匹配，且仅替换首次出现的位置。\n参数:\n- target (字符串, 必需): 当前 Canvas 活跃文档中要替换的精确原文。\n- replace (字符串, 必需): 替换后的新内容，可为空字符串以删除 target。\n调用格式:\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」EditCanvas「末」,\ntarget:「始」需要修改的精确原文「末」,\nreplace:「始」修改后的内容「末」\n<<<[END_TOOL_REQUEST]>>>"
-     }
-   ]
+      {
+        "command": "UpdateHistory",
+        "description": "安全替换 JSON 聊天历史文件中 AI 发言（role:'assistant'）的首次匹配文本。参数：filePath(必需), target(必需), replace(必需)。"
+      },
+      {
+        "command": "CreateCanvas",
+        "description": "在 Canvas 目录新建文件并打开客户端 Canvas 窗口展示。参数：fileName(必需, 含扩展名), content(必需)。"
+      },
+      {
+        "command": "EditCanvas",
+        "description": "向当前已打开的客户端 Canvas 活跃文档提交精确首次匹配编辑提案（禁传 filePath，经前端差异审阅用户允许后落盘）。参数：target(必需), replace(必需，空串表示删除)。\n<<<[TOOL_REQUEST]>>>\ntool_name:「始」FileOperator「末」,\ncommand:「始」EditCanvas「末」,\ntarget:「始」需要修改的精确原文「末」,\nreplace:「始」修改后的内容「末」\n<<<[END_TOOL_REQUEST]>>>"
+      }
+    ]
  }
 }

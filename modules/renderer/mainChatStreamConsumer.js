@@ -1,4 +1,5 @@
 import { normalizeStreamChunk } from '../chat/contentRuntime.js';
+import { findToolReturnBoundary } from './toolReturnBoundary.js';
 
 const terminalTypes = new Set(['completed', 'failed', 'cancelled', 'discarded']);
 
@@ -9,6 +10,7 @@ const buildMessage = event => {
         role: 'assistant',
         name: context.agentName,
         agentId: context.agentId,
+        admissionToken: context.admissionToken,
         avatarUrl: context.avatarUrl,
         avatarColor: context.avatarColor,
         content: event.type === 'agent_thinking' ? '思考中...' : '',
@@ -30,7 +32,30 @@ export function createMainChatStreamConsumer(initialEvent, capabilities) {
     let preparedType = null;
     const projection = capabilities.resolveProjection?.(messageId) || null;
     let accumulatedText = '';
-    let checkedBoundaryCount = 0;
+    let checkedBoundary = 0;
+    let checkingBoundary = false;
+    let active = true;
+
+    function checkToolReturn() {
+        if (!active || checkingBoundary || context.isGroupMessage || context.groupId) return;
+        const boundary = findToolReturnBoundary(accumulatedText);
+        if (!boundary || boundary <= checkedBoundary) return;
+        checkedBoundary = boundary;
+        checkingBoundary = true;
+        const isCurrentBoundary = () => active && findToolReturnBoundary(accumulatedText) === boundary;
+        Promise.resolve().then(() => {
+            if (!isCurrentBoundary()) return;
+            return capabilities.onToolReturnBoundary?.({
+                messageId, context, text: accumulatedText,
+                isActive: isCurrentBoundary,
+            });
+        }).catch(error => capabilities.reportError?.('[ContextCompaction] Boundary check failed', error))
+            .finally(() => {
+                checkingBoundary = false;
+                // 较慢的预算查询期间若又完整返回了一批工具，只检查最新安全点。
+                checkToolReturn();
+            });
+    }
 
     return Object.freeze({
         surfaceGeneration: capabilities.getSurfaceGeneration?.(),
@@ -44,6 +69,7 @@ export function createMainChatStreamConsumer(initialEvent, capabilities) {
         },
         consume(event) {
             const terminal = terminalTypes.has(event.type);
+            if (terminal) active = false;
             if (projection?.suppressed) {
                 if (terminal) projection.settle?.({ event, finalized: event.outcome?.persistence?.value, context, messageId });
                 return;
@@ -51,15 +77,7 @@ export function createMainChatStreamConsumer(initialEvent, capabilities) {
             if (event.type === 'chunk') {
                 (projection?.append || capabilities.append)(messageId, event.text, context, operationId);
                 accumulatedText += event.text;
-                if (!context.isGroupMessage && !context.groupId) {
-                    const boundaries = accumulatedText.match(/^[ \t]*<<<\[END_ROLE_DIVIDE_USER\]>>>[ \t]*(?=\r?$)/gm) || [];
-                    if (boundaries.length > checkedBoundaryCount) {
-                        checkedBoundaryCount = boundaries.length;
-                        Promise.resolve(capabilities.onToolReturnBoundary?.({
-                            messageId, context, text: accumulatedText,
-                        })).catch(error => capabilities.reportError?.('[ContextCompaction] Boundary check failed', error));
-                    }
-                }
+                checkToolReturn();
             }
             if (!terminal) return;
             const finalized = event.outcome?.persistence?.value;
@@ -77,6 +95,7 @@ export function createMainChatStreamConsumer(initialEvent, capabilities) {
             capabilities.onSettled?.({ event: settledEvent, finalized, context, messageId });
         },
         async persist(value) {
+            active = false;
             if (projection?.suppressed) return null;
             const terminal = value.terminal || {};
             if (terminal.phase === 'projection') {
@@ -124,6 +143,6 @@ export function createMainChatStreamConsumer(initialEvent, capabilities) {
             }
             return finalized;
         },
-        dispose() { projection?.release?.(); },
+        dispose() { active = false; projection?.release?.(); },
     });
 }
